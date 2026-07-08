@@ -168,6 +168,21 @@ function _smFmt(s) {
     return Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
 }
 
+// Node-only export hook for tests; browsers fall through to the side-effect
+// IIFE below (poller + playSong/showScreen wrapping).
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        _smGetColor, _smFmt, _smCreate, _smRemove, _smUpdate, _smRender,
+        _smOnClick, _smOnWheel,
+        _getState: () => ({ bar: _smBar, sections: _smSections, duration: _smDuration }),
+        _setState(next) {
+            if ('sections' in next) _smSections = next.sections;
+            if ('duration' in next) _smDuration = next.duration;
+            if ('bar' in next) _smBar = next.bar;
+        },
+    };
+} else {
+
 // Side effects: poller + playSong/showScreen wrappers. Consolidated under
 // one idempotency guard so re-evaluation (loader cache miss, hot reload,
 // older core builds without the load-side guard) doesn't start a second
@@ -197,3 +212,5 @@ function _smFmt(s) {
         origShowScreen(id);
     };
 })();
+
+}
