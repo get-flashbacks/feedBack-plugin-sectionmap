@@ -174,6 +174,137 @@ test('_smOnWheel fallback pokes the raw <audio> when there is no seek API', () =
     assert.equal(audio.currentTime, 10.1); // scroll up -> forward by 0.1s (ctrl = fine)
 });
 
+// ── Glass-filling difficulty visualization (sectionmap#1) ──────────────────
+// The section-difficulty data these tests feed in is exactly the shape
+// window.highway.getPhrases() returns per feedBack core (and per
+// feedback-plugin-dynamic-difficulty's own COMPLIANCE.md writeup of the
+// same contract): [{ index, start_time, end_time, max_difficulty }].
+
+test('_smSectionDifficulty returns null when no phrase overlaps the section window', () => {
+    const mod = freshPlugin();
+    const phrases = [{ start_time: 20, end_time: 30, max_difficulty: 3 }];
+    assert.equal(mod._smSectionDifficulty(0, 10, phrases), null);
+});
+
+test('_smSectionDifficulty returns null with no phrase data at all', () => {
+    const mod = freshPlugin();
+    assert.equal(mod._smSectionDifficulty(0, 10, null), null);
+    assert.equal(mod._smSectionDifficulty(0, 10, []), null);
+});
+
+test('_smSectionDifficulty takes the max max_difficulty across overlapping phrases', () => {
+    const mod = freshPlugin();
+    const phrases = [
+        { start_time: 0, end_time: 5, max_difficulty: 1 },
+        { start_time: 5, end_time: 10, max_difficulty: 3 },
+        { start_time: 10, end_time: 15, max_difficulty: 2 }, // outside [0,10)
+    ];
+    assert.deepEqual(mod._smSectionDifficulty(0, 10, phrases), { max_difficulty: 3 });
+});
+
+test('_smComputeGlass yields null per section when the song has no phrase data', () => {
+    const mod = freshPlugin();
+    const sections = [{ name: 'Intro', time: 0 }, { name: 'Verse', time: 10 }];
+    assert.deepEqual(mod._smComputeGlass(sections, 20, null, 0.5), [null, null]);
+});
+
+test('_smComputeGlass sizes a harder section larger and scales fill by current mastery', () => {
+    const mod = freshPlugin();
+    const sections = [{ name: 'Easy bit', time: 0 }, { name: 'Hard bit', time: 10 }];
+    const phrases = [
+        { start_time: 0, end_time: 10, max_difficulty: 1 },
+        { start_time: 10, end_time: 20, max_difficulty: 3 },
+    ];
+    const glasses = mod._smComputeGlass(sections, 20, phrases, 1.0); // full mastery
+    assert.ok(glasses[1].sizeFrac > glasses[0].sizeFrac, 'harder section gets a taller glass');
+    assert.equal(glasses[0].fillFrac, 1, 'full mastery fills every glass completely');
+    assert.equal(glasses[1].fillFrac, 1);
+});
+
+test('_smComputeGlass at zero mastery leaves every glass empty', () => {
+    const mod = freshPlugin();
+    const sections = [{ name: 'A', time: 0 }];
+    const phrases = [{ start_time: 0, end_time: 10, max_difficulty: 3 }];
+    const glasses = mod._smComputeGlass(sections, 10, phrases, 0);
+    assert.equal(glasses[0].fillFrac, 0);
+});
+
+test('_smComputeGlass gives a zero-difficulty section a full glass (nothing to fill toward)', () => {
+    const mod = freshPlugin();
+    const sections = [{ name: 'A', time: 0 }];
+    const phrases = [{ start_time: 0, end_time: 10, max_difficulty: 0 }];
+    const glasses = mod._smComputeGlass(sections, 10, phrases, 0.1);
+    assert.equal(glasses[0].fillFrac, 1);
+});
+
+test('_smComputeGlass marks a section null when it has no overlapping phrase, even if others do', () => {
+    const mod = freshPlugin();
+    const sections = [{ name: 'Has data', time: 0 }, { name: 'No data', time: 100 }];
+    const phrases = [{ start_time: 0, end_time: 10, max_difficulty: 2 }];
+    const glasses = mod._smComputeGlass(sections, 200, phrases, 0.5);
+    assert.ok(glasses[0] !== null);
+    assert.equal(glasses[1], null);
+});
+
+test('_smGlassHtml renders nothing for a null glass (missing/delayed data degrades silently)', () => {
+    const mod = freshPlugin();
+    assert.equal(mod._smGlassHtml(null), '');
+});
+
+test('_smGlassHtml renders a fill bar sized proportionally to fillFrac', () => {
+    const mod = freshPlugin();
+    const html = mod._smGlassHtml({ sizeFrac: 1, fillFrac: 0.5 });
+    assert.ok(html.includes('sm-glass'));
+    assert.ok(html.includes('height:7px')); // sizeFrac=1 -> glass h=14px; fillFrac=0.5 -> fill h=7px
+});
+
+test('_smReadPhraseState degrades to no phrases/zero mastery without a highway global', () => {
+    const mod = freshPlugin();
+    assert.deepEqual(mod._smReadPhraseState(), { phrases: null, mastery: 0 });
+});
+
+test('_smReadPhraseState reads phrases only when hasPhraseData() is true', () => {
+    const mod = freshPlugin();
+    global.highway = {
+        hasPhraseData: () => false,
+        getPhrases: () => { throw new Error('must not be called when hasPhraseData() is false'); },
+        getMastery: () => 0.42,
+    };
+    try {
+        assert.deepEqual(mod._smReadPhraseState(), { phrases: null, mastery: 0.42 });
+    } finally {
+        delete global.highway;
+    }
+});
+
+test('_smUpdate refreshes each block\'s glass-slot markup from live phrase/mastery state', () => {
+    const mod = freshPlugin();
+    const bar = new FakeBar();
+    const slotA = { innerHTML: '' };
+    const slotB = { innerHTML: '' };
+    bar.querySelectorAll = (sel) => (sel === '.sm-glass-slot' ? [slotA, slotB] : []);
+    const sections = [{ name: 'A', time: 0 }, { name: 'B', time: 10 }];
+    mod._setState({ bar, sections, duration: 20 });
+    global.highway = {
+        getSections: () => sections,
+        getSongInfo: () => ({ duration: 20 }),
+        getTime: () => 0,
+        hasPhraseData: () => true,
+        getPhrases: () => [
+            { start_time: 0, end_time: 10, max_difficulty: 1 },
+            { start_time: 10, end_time: 20, max_difficulty: 3 },
+        ],
+        getMastery: () => 1.0,
+    };
+    try {
+        mod._smUpdate();
+        assert.ok(slotA.innerHTML.includes('sm-glass'));
+        assert.ok(slotB.innerHTML.includes('sm-glass'));
+    } finally {
+        delete global.highway;
+    }
+});
+
 test('_smOnWheel/_smOnClick are no-ops without a known duration', () => {
     const mod = freshPlugin();
     const audio = new FakeAudio();

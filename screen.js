@@ -114,6 +114,19 @@ function _smOnWheel(e) {
     _smSeek(newTime, 'sectionmap-wheel');
 }
 
+// Reads the Host's phrase-difficulty surface defensively — feature-detected
+// exactly like dynamic_difficulty's own HUD, so a Host/version without it
+// (or simply no phrase data for the current song) degrades to "no glasses,"
+// never an error (sectionmap#1 / this repo's contract with #8's "handle
+// missing/delayed section-difficulty data gracefully").
+function _smReadPhraseState() {
+    if (typeof highway === 'undefined' || !highway) return { phrases: null, mastery: 0 };
+    const has = typeof highway.hasPhraseData === 'function' && highway.hasPhraseData();
+    const phrases = has && typeof highway.getPhrases === 'function' ? highway.getPhrases() : null;
+    const mastery = typeof highway.getMastery === 'function' ? highway.getMastery() : 0;
+    return { phrases, mastery };
+}
+
 function _smUpdate() {
     if (!_smBar) return;
     const sections = highway.getSections();
@@ -147,6 +160,17 @@ function _smUpdate() {
     blocks.forEach((block, i) => {
         block.style.opacity = i === activeIdx ? '1' : '0.5';
     });
+
+    // Refresh glass fill levels every tick — mastery (and thus fillFrac) can
+    // change mid-song (manual slider move, or dynamic_difficulty's own
+    // auto-adjust) without the section list itself changing, so this can't
+    // be folded into the "sections changed -> _smRender()" rebuild above.
+    const { phrases, mastery } = _smReadPhraseState();
+    const glasses = _smComputeGlass(_smSections, _smDuration, phrases, mastery);
+    const glassEls = _smBar.querySelectorAll('.sm-glass-slot');
+    glassEls.forEach((slot, i) => {
+        slot.innerHTML = _smGlassHtml(glasses[i]);
+    });
 }
 
 function _smRender() {
@@ -168,6 +192,7 @@ function _smRender() {
         html += `<div class="sm-block" style="position:absolute;left:${startPct}%;width:${widthPct}%;top:0;bottom:0;background:${color};border-right:1px solid rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;overflow:hidden;transition:opacity 0.15s;"
             title="${label} (${_smFmt(sec.time)})">
             <span style="font-size:9px;color:rgba(255,255,255,0.8);white-space:nowrap;text-overflow:ellipsis;overflow:hidden;padding:0 3px;">${label}</span>
+            <div class="sm-glass-slot" style="position:absolute;inset:0;pointer-events:none;"></div>
         </div>`;
     }
 
@@ -182,12 +207,106 @@ function _smFmt(s) {
     return Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
 }
 
+// ── Glass-filling difficulty visualization (sectionmap#1) ──────────────────
+//
+// Section-level difficulty is NOT this plugin's own data — it's read straight
+// off the Host's own window.highway object (getPhrases()/hasPhraseData()/
+// getMastery()), the exact same surface feedback-plugin-dynamic-difficulty's
+// own glass HUD (screen.js's drawHud()) consumes. There is no bespoke API or
+// event between the two plugins: both are independent readers of Host state,
+// so this works whether or not dynamic_difficulty is even installed (it just
+// needs SOME producer of phrase data — dynamic_difficulty's /generate route,
+// or a hand-authored ladder, either populates the same window.highway state).
+// See feedback-plugin-dynamic-difficulty's COMPLIANCE.md for the full writeup
+// (issue #9 / #8 of that repo).
+//
+// Glass metaphor: glass SIZE reflects a section's own peak authored
+// difficulty relative to the song's hardest section (a harder section gets a
+// taller glass); glass FILL reflects how much of that section's difficulty
+// range the current master-difficulty setting reaches — mirroring
+// dynamic_difficulty's own per-phrase HUD math exactly, just aggregated to
+// section (not phrase) boundaries, since this plugin's minimap is
+// section-shaped, not phrase-shaped.
+
+// Returns { max_difficulty } for the phrase(s) overlapping [t0, t1), or null
+// if no phrase overlaps that range at all (a song can have phrase data for
+// only part of its runtime, or none). Pure function — no DOM, no Host globals
+// — so it's directly unit-testable.
+function _smSectionDifficulty(t0, t1, phrases) {
+    if (!phrases || !phrases.length) return null;
+    let maxDiff = null;
+    for (let i = 0; i < phrases.length; i++) {
+        const p = phrases[i];
+        if (p.end_time <= t0 || p.start_time >= t1) continue; // no overlap
+        if (maxDiff === null || p.max_difficulty > maxDiff) maxDiff = p.max_difficulty;
+    }
+    return maxDiff === null ? null : { max_difficulty: maxDiff };
+}
+
+// Computes { sizeFrac, fillFrac } for every section, given the full phrase
+// list and the current 0..1 mastery value. A section with no overlapping
+// phrase data yields `null` at its index — callers must degrade that entry
+// to "no glass" rather than drawing a zero-size one (missing data reads as
+// absent, not as "difficulty zero").
+function _smComputeGlass(sections, duration, phrases, mastery) {
+    if (!sections || !sections.length || !duration) return [];
+    if (!phrases || !phrases.length) return sections.map(() => null);
+
+    let songMaxDiff = 0;
+    for (let i = 0; i < phrases.length; i++) {
+        if (phrases[i].max_difficulty > songMaxDiff) songMaxDiff = phrases[i].max_difficulty;
+    }
+
+    const m = (typeof mastery === 'number' && isFinite(mastery)) ? Math.max(0, Math.min(1, mastery)) : 0;
+
+    return sections.map((sec, i) => {
+        const t0 = sec.time;
+        const t1 = (i + 1 < sections.length) ? sections[i + 1].time : duration;
+        const diff = _smSectionDifficulty(t0, t1, phrases);
+        if (diff === null) return null;
+
+        const maxD = diff.max_difficulty;
+        const sizeFrac = songMaxDiff > 0 ? Math.max(0.3, maxD / songMaxDiff) : 0.3;
+        let fillFrac = 1;
+        if (maxD > 0) {
+            const idxLevel = Math.min(maxD, Math.floor(m * (maxD + 1)));
+            fillFrac = idxLevel / maxD;
+        }
+        return { sizeFrac, fillFrac };
+    });
+}
+
+// Builds the glass's inner markup (outline + fill), sized within a
+// GLASS_W x GLASS_MAX_H box. Kept as its own small template so both the
+// player and (should a maker screen ever mount this same bar — see
+// COMPLIANCE.md's note that no such screen exists in feedBack today) render
+// byte-identical glasses from the same function, per sectionmap#1's
+// "consistent across maker and player" requirement.
+const GLASS_W = 10, GLASS_MAX_H = 14, GLASS_MIN_H = 5;
+
+function _smGlassHtml(glass) {
+    if (!glass) return '';
+    const h = GLASS_MIN_H + (GLASS_MAX_H - GLASS_MIN_H) * glass.sizeFrac;
+    const fillH = Math.max(0, h * glass.fillFrac);
+    const fillColor = glass.fillFrac > 0.8 ? 'rgba(224,80,80,0.85)'
+        : glass.fillFrac > 0.4 ? 'rgba(232,192,64,0.85)'
+            : 'rgba(64,160,224,0.85)';
+    return '<div class="sm-glass" style="position:absolute;bottom:2px;right:2px;' +
+        'width:' + GLASS_W + 'px;height:' + GLASS_MAX_H + 'px;pointer-events:none;">' +
+        '<div style="position:absolute;left:0;right:0;bottom:0;height:' + h + 'px;' +
+        'border:1px solid rgba(255,255,255,0.6);border-radius:2px;box-sizing:border-box;">' +
+        '<div style="position:absolute;left:1px;right:1px;bottom:1px;height:' + fillH + 'px;' +
+        'background:' + fillColor + ';"></div>' +
+        '</div></div>';
+}
+
 // Node-only export hook for tests; browsers fall through to the side-effect
 // IIFE below (poller + playSong/showScreen wrapping).
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         _smGetColor, _smFmt, _smCreate, _smRemove, _smUpdate, _smRender,
         _smOnClick, _smOnWheel,
+        _smSectionDifficulty, _smComputeGlass, _smGlassHtml, _smReadPhraseState,
         _getState: () => ({ bar: _smBar, sections: _smSections, duration: _smDuration }),
         _setState(next) {
             if ('sections' in next) _smSections = next.sections;
