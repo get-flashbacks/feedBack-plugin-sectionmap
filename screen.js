@@ -276,10 +276,12 @@ function _smRender() {
             ? _smRenderGlassFilling(difficulty)
             : '';
 
+        const safeLabel = _smEscapeHtml(label);
+        const safeTitle = _smEscapeHtml(`${titleLabel} (${_smFmt(sec.time)})`);
         html += `<div class="sm-block" style="position:absolute;left:${startPct}%;width:${widthPct}%;top:0;bottom:0;background:${color};border-right:1px solid rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;overflow:hidden;transition:opacity 0.15s;"
-            title="${titleLabel} (${_smFmt(sec.time)})">
+            title="${safeTitle}">
             ${difficultyContent}
-            <span style="font-size:9px;color:rgba(255,255,255,0.8);white-space:nowrap;text-overflow:ellipsis;overflow:hidden;padding:0 3px;">${label}</span>
+            <span style="font-size:9px;color:rgba(255,255,255,0.8);white-space:nowrap;text-overflow:ellipsis;overflow:hidden;padding:0 3px;">${safeLabel}</span>
         </div>`;
     }
 
@@ -316,12 +318,21 @@ function _smFmt(s) {
     return Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
 }
 
+function _smEscapeHtml(value) {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 // Node-only export hook for tests; browsers fall through to the side-effect
 // IIFE below (poller + playSong/showScreen wrapping).
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         _smGetColor, _smFmt, _smCreate, _smRemove, _smUpdate, _smRender,
-        _smOnClick, _smOnWheel,
+        _smOnClick, _smOnWheel, _smEscapeHtml,
         _smIsDynamicDifficultyAvailable, _smGetSectionDifficulty, _smRenderGlassFilling,
         _smInitializeDifficultyListener, _smStartRealtimeHooks, _smStopRealtimeHooks, _smSetPlayerVisible,
         _getState: () => ({ bar: _smBar, sections: _smSections, duration: _smDuration, sectionDifficulty: _smSectionDifficulty, ddAvailable: _smDynamicDifficultyAvailable }),
