@@ -1,9 +1,12 @@
 // Section Map plugin
 // Shows a minimap bar of the full song structure with clickable sections.
+// Includes optional glass-filling difficulty visualization when dynamic-difficulty is installed.
 
 let _smBar = null;
 let _smSections = [];
 let _smDuration = 0;
+let _smSectionDifficulty = {}; // Map of section index to difficulty data
+let _smDynamicDifficultyAvailable = false;
 
 const SM_COLORS = {
     'intro': '#3b82f6',
@@ -25,6 +28,41 @@ function _smGetColor(name) {
         if (low.includes(key)) return color;
     }
     return SM_COLORS.default;
+}
+
+// Check if dynamic-difficulty plugin is installed and available
+function _smIsDynamicDifficultyAvailable() {
+    if (typeof window.feedBack === 'undefined') return false;
+    // Check if dynamic-difficulty is in the active plugins list or has exposed a capability
+    if (typeof window.feedBackViz_dynamic_difficulty !== 'undefined') return true;
+    // Additional check: look for dynamic-difficulty's global scope if available
+    if (typeof window._ddCapabilities !== 'undefined') return true;
+    return false;
+}
+
+// Get difficulty data for a section from dynamic-difficulty plugin
+function _smGetSectionDifficulty(sectionIndex) {
+    if (!_smDynamicDifficultyAvailable) return null;
+    // This would be populated by a capability or event from dynamic-difficulty
+    // For now, return from cache if available
+    return _smSectionDifficulty[sectionIndex] || null;
+}
+
+// Initialize difficulty data listener if dynamic-difficulty is available
+function _smInitializeDifficultyListener() {
+    _smDynamicDifficultyAvailable = _smIsDynamicDifficultyAvailable();
+
+    if (_smDynamicDifficultyAvailable && typeof window.feedBack !== 'undefined') {
+        // Listen for difficulty updates from dynamic-difficulty plugin
+        window.feedBack.on('difficulty:sections-updated', (event) => {
+            const { sectionDifficulties } = event.detail || {};
+            if (sectionDifficulties) {
+                _smSectionDifficulty = sectionDifficulties;
+                // Trigger re-render with new difficulty data
+                _smRender();
+            }
+        });
+    }
 }
 
 function _smCreate() {
@@ -165,8 +203,15 @@ function _smRender() {
         let label = sec.name.replace(/\d+$/, '').trim();
         label = label.charAt(0).toUpperCase() + label.slice(1);
 
+        // Get difficulty data if available
+        const difficulty = _smGetSectionDifficulty(i);
+        const difficultyContent = _smDynamicDifficultyAvailable && difficulty
+            ? _smRenderGlassFilling(difficulty)
+            : '';
+
         html += `<div class="sm-block" style="position:absolute;left:${startPct}%;width:${widthPct}%;top:0;bottom:0;background:${color};border-right:1px solid rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;overflow:hidden;transition:opacity 0.15s;"
             title="${label} (${_smFmt(sec.time)})">
+            ${difficultyContent}
             <span style="font-size:9px;color:rgba(255,255,255,0.8);white-space:nowrap;text-overflow:ellipsis;overflow:hidden;padding:0 3px;">${label}</span>
         </div>`;
     }
@@ -176,6 +221,28 @@ function _smRender() {
 
     _smBar.innerHTML = html;
     _smBar.style.position = 'relative';
+}
+
+// Render glass-filling visualization for section difficulty
+function _smRenderGlassFilling(difficulty) {
+    if (!difficulty || typeof difficulty.fillPercentage !== 'number') return '';
+
+    const fillPct = Math.max(0, Math.min(100, difficulty.fillPercentage));
+    const glassSize = difficulty.glassSize || 'medium'; // small, medium, large
+
+    // Size classes for the glass
+    const sizeStyles = {
+        small: 'width:12px;height:12px;',
+        medium: 'width:16px;height:16px;',
+        large: 'width:20px;height:20px;',
+    };
+
+    const glassStyle = sizeStyles[glassSize] || sizeStyles.medium;
+
+    return `<div style="position:relative;${glassStyle}margin-right:4px;background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.4);border-radius:2px;display:flex;align-items:flex-end;overflow:hidden;"
+        title="Difficulty: ${fillPct.toFixed(0)}%">
+        <div style="width:100%;height:${fillPct}%;background:rgba(255,200,100,0.7);transition:height 0.3s ease;"></div>
+    </div>`;
 }
 
 function _smFmt(s) {
@@ -188,11 +255,15 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         _smGetColor, _smFmt, _smCreate, _smRemove, _smUpdate, _smRender,
         _smOnClick, _smOnWheel,
-        _getState: () => ({ bar: _smBar, sections: _smSections, duration: _smDuration }),
+        _smIsDynamicDifficultyAvailable, _smGetSectionDifficulty, _smRenderGlassFilling,
+        _smInitializeDifficultyListener,
+        _getState: () => ({ bar: _smBar, sections: _smSections, duration: _smDuration, sectionDifficulty: _smSectionDifficulty, ddAvailable: _smDynamicDifficultyAvailable }),
         _setState(next) {
             if ('sections' in next) _smSections = next.sections;
             if ('duration' in next) _smDuration = next.duration;
             if ('bar' in next) _smBar = next.bar;
+            if ('sectionDifficulty' in next) _smSectionDifficulty = next.sectionDifficulty;
+            if ('ddAvailable' in next) _smDynamicDifficultyAvailable = next.ddAvailable;
         },
     };
 } else {
@@ -206,6 +277,9 @@ if (typeof module !== 'undefined' && module.exports) {
     if (window[HOOK_KEY]) return;
     window[HOOK_KEY] = true;
 
+    // Initialize difficulty listener if dynamic-difficulty is available
+    _smInitializeDifficultyListener();
+
     // Poll for updates
     setInterval(_smUpdate, 200);
 
@@ -215,6 +289,7 @@ if (typeof module !== 'undefined' && module.exports) {
         _smRemove();
         _smSections = [];
         _smDuration = 0;
+        _smSectionDifficulty = {};
         await origPlaySong(filename, arrangement);
         _smCreate();
     };
