@@ -14,17 +14,20 @@ let _smDifficultyUnsubscribe = null;
 let _smSongReadySubscribed = false;
 let _smDifficultySubscribed = false;
 
+// Most-specific-first: 'pre' must come before 'chorus'/'verse' so a
+// "pre-chorus"/"pre-verse" section name (which contains both substrings)
+// matches its own color instead of falling through to the base section's.
 const SM_COLORS = {
+    'pre': '#84cc16',
+    'noguitar': '#374151',
+    'breakdown': '#f97316',
+    'riff': '#06b6d4',
     'intro': '#3b82f6',
     'verse': '#22c55e',
     'chorus': '#eab308',
     'bridge': '#a855f7',
     'solo': '#ef4444',
     'outro': '#6b7280',
-    'breakdown': '#f97316',
-    'riff': '#06b6d4',
-    'pre': '#84cc16',
-    'noguitar': '#374151',
     'default': '#4b5563',
 };
 
@@ -259,8 +262,13 @@ function _smRender() {
         const color = _smGetColor(sec.name);
 
         // Clean up section name for display
+        const ordinalMatch = sec.name.match(/(\d+)$/);
         let label = sec.name.replace(/\d+$/, '').trim();
         label = label.charAt(0).toUpperCase() + label.slice(1);
+        // The on-bar label drops the trailing digit (no room for "Verse 2" in
+        // a ~9px-tall strip), but the hover title keeps it — otherwise two
+        // "Verse" blocks are indistinguishable on mouseover.
+        const titleLabel = ordinalMatch ? `${label} ${ordinalMatch[1]}` : label;
 
         // Get difficulty data if available
         const difficulty = _smGetSectionDifficulty(i);
@@ -269,7 +277,7 @@ function _smRender() {
             : '';
 
         html += `<div class="sm-block" style="position:absolute;left:${startPct}%;width:${widthPct}%;top:0;bottom:0;background:${color};border-right:1px solid rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;overflow:hidden;transition:opacity 0.15s;"
-            title="${label} (${_smFmt(sec.time)})">
+            title="${titleLabel} (${_smFmt(sec.time)})">
             ${difficultyContent}
             <span style="font-size:9px;color:rgba(255,255,255,0.8);white-space:nowrap;text-overflow:ellipsis;overflow:hidden;padding:0 3px;">${label}</span>
         </div>`;
