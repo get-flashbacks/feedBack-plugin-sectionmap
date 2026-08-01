@@ -77,7 +77,7 @@ function _smStartRealtimeHooks() {
             _smSectionDifficulty = {};
             _smUpdate();
         });
-        _smSongReadySubscribed = true;
+        _smSongReadySubscribed = typeof _smSongReadyUnsubscribe === 'function';
     }
 
     _smInitializeDifficultyListener();
@@ -89,7 +89,7 @@ function _smStartRealtimeHooks() {
                 _smRender();
             }
         });
-        _smDifficultySubscribed = true;
+        _smDifficultySubscribed = typeof _smDifficultyUnsubscribe === 'function';
     }
 }
 
@@ -101,15 +101,15 @@ function _smStopRealtimeHooks() {
 
     if (typeof _smSongReadyUnsubscribe === 'function') {
         _smSongReadyUnsubscribe();
-        _smSongReadySubscribed = false;
     }
     _smSongReadyUnsubscribe = null;
+    _smSongReadySubscribed = false;
 
     if (typeof _smDifficultyUnsubscribe === 'function') {
         _smDifficultyUnsubscribe();
-        _smDifficultySubscribed = false;
     }
     _smDifficultyUnsubscribe = null;
+    _smDifficultySubscribed = false;
 }
 
 function _smSetPlayerVisible(isVisible) {
