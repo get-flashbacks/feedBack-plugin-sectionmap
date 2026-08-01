@@ -184,3 +184,160 @@ test('_smOnWheel/_smOnClick are no-ops without a known duration', () => {
     mod._smOnWheel({ deltaY: 1, preventDefault: () => {} });
     assert.equal(audio.currentTime, 0); // untouched
 });
+
+test('_smSetPlayerVisible keeps at most one poller/subscription across show/hide cycles', () => {
+    const mod = freshPlugin();
+    const originalSetInterval = global.setInterval;
+    const originalClearInterval = global.clearInterval;
+    const originalHighway = global.highway;
+    let nextId = 1;
+    const activeIntervals = new Map();
+    let setCalls = 0;
+    let clearCalls = 0;
+    let onCalls = 0;
+    let unsubscribeCalls = 0;
+
+    global.highway = {
+        getSections: () => [],
+        getSongInfo: () => ({ duration: 0 }),
+        getTime: () => 0,
+    };
+    global.window.feedBack = {
+        on: () => {
+            onCalls++;
+            return () => { unsubscribeCalls++; };
+        },
+    };
+    global.setInterval = (fn) => {
+        setCalls++;
+        const id = nextId++;
+        activeIntervals.set(id, fn);
+        return id;
+    };
+    global.clearInterval = (id) => {
+        clearCalls++;
+        activeIntervals.delete(id);
+    };
+
+    try {
+        mod._smSetPlayerVisible(true);
+        mod._smSetPlayerVisible(true);
+        assert.equal(setCalls, 1);
+        assert.equal(onCalls, 1);
+        assert.equal(activeIntervals.size, 1);
+
+        mod._smSetPlayerVisible(false);
+        assert.equal(clearCalls, 1);
+        assert.equal(unsubscribeCalls, 1);
+        assert.equal(activeIntervals.size, 0);
+
+        mod._smSetPlayerVisible(true);
+        assert.equal(setCalls, 2);
+        assert.equal(onCalls, 2);
+        assert.equal(activeIntervals.size, 1);
+
+        mod._smSetPlayerVisible(false);
+        assert.equal(clearCalls, 2);
+        assert.equal(unsubscribeCalls, 2);
+        assert.equal(activeIntervals.size, 0);
+    } finally {
+        global.setInterval = originalSetInterval;
+        global.clearInterval = originalClearInterval;
+        if (typeof originalHighway === 'undefined') delete global.highway;
+        else global.highway = originalHighway;
+    }
+});
+
+test('_smSetPlayerVisible(false) stops polling so inactive screens do not tick _smUpdate', () => {
+    const mod = freshPlugin();
+    const originalSetInterval = global.setInterval;
+    const originalClearInterval = global.clearInterval;
+    const originalHighway = global.highway;
+    let nextId = 1;
+    const activeIntervals = new Map();
+    let ticks = 0;
+
+    const tickAll = () => {
+        for (const fn of activeIntervals.values()) {
+            ticks++;
+            fn();
+        }
+    };
+
+    global.highway = {
+        getSections: () => [],
+        getSongInfo: () => ({ duration: 0 }),
+        getTime: () => 0,
+    };
+    global.window.feedBack = { on: () => () => {} };
+    global.setInterval = (fn) => {
+        const id = nextId++;
+        activeIntervals.set(id, fn);
+        return id;
+    };
+    global.clearInterval = (id) => {
+        activeIntervals.delete(id);
+    };
+
+    try {
+        mod._smSetPlayerVisible(true);
+        tickAll();
+        tickAll();
+        assert.equal(ticks, 2);
+
+        mod._smSetPlayerVisible(false);
+        tickAll();
+        tickAll();
+        assert.equal(ticks, 2);
+    } finally {
+        global.setInterval = originalSetInterval;
+        global.clearInterval = originalClearInterval;
+        if (typeof originalHighway === 'undefined') delete global.highway;
+        else global.highway = originalHighway;
+    }
+});
+
+
+test('_smSetPlayerVisible retries event subscription after feedBack becomes available', () => {
+    const mod = freshPlugin();
+    const originalSetInterval = global.setInterval;
+    const originalClearInterval = global.clearInterval;
+    const originalHighway = global.highway;
+    const originalFeedBack = global.window.feedBack;
+    let intervalId = 0;
+    let onCalls = 0;
+    let unsubscribeCalls = 0;
+
+    global.highway = {
+        getSections: () => [],
+        getSongInfo: () => ({ duration: 0 }),
+        getTime: () => 0,
+    };
+    delete global.window.feedBack;
+    global.setInterval = () => ++intervalId;
+    global.clearInterval = () => {};
+
+    try {
+        mod._smSetPlayerVisible(true);
+        global.window.feedBack = {
+            on: () => {
+                onCalls++;
+                return () => { unsubscribeCalls++; };
+            },
+        };
+
+        mod._smSetPlayerVisible(true);
+        assert.equal(onCalls, 1);
+
+        mod._smSetPlayerVisible(false);
+        assert.equal(unsubscribeCalls, 1);
+    } finally {
+        mod._smSetPlayerVisible(false);
+        global.setInterval = originalSetInterval;
+        global.clearInterval = originalClearInterval;
+        if (typeof originalHighway === 'undefined') delete global.highway;
+        else global.highway = originalHighway;
+        if (typeof originalFeedBack === 'undefined') delete global.window.feedBack;
+        else global.window.feedBack = originalFeedBack;
+    }
+});

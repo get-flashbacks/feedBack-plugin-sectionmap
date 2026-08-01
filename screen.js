@@ -7,6 +7,12 @@ let _smSections = [];
 let _smDuration = 0;
 let _smSectionDifficulty = {}; // Map of section index to difficulty data
 let _smDynamicDifficultyAvailable = false;
+let _smPoller = null;
+let _smPlayerVisible = false;
+let _smSongReadyUnsubscribe = null;
+let _smDifficultyUnsubscribe = null;
+let _smSongReadySubscribed = false;
+let _smDifficultySubscribed = false;
 
 const SM_COLORS = {
     'intro': '#3b82f6',
@@ -51,18 +57,71 @@ function _smGetSectionDifficulty(sectionIndex) {
 // Initialize difficulty data listener if dynamic-difficulty is available
 function _smInitializeDifficultyListener() {
     _smDynamicDifficultyAvailable = _smIsDynamicDifficultyAvailable();
+}
 
-    if (_smDynamicDifficultyAvailable && typeof window.feedBack !== 'undefined') {
-        // Listen for difficulty updates from dynamic-difficulty plugin
-        window.feedBack.on('difficulty:sections-updated', (event) => {
+function _smSubscribeFeedBackEvent(eventName, handler) {
+    if (typeof window.feedBack === 'undefined' || typeof window.feedBack.on !== 'function') return null;
+    const unsubscribe = window.feedBack.on(eventName, handler);
+    if (typeof unsubscribe === 'function') return unsubscribe;
+    if (typeof window.feedBack.off === 'function') return () => window.feedBack.off(eventName, handler);
+    return null;
+}
+
+function _smStartRealtimeHooks() {
+    if (!_smPoller) _smPoller = setInterval(_smUpdate, 200);
+
+    if (!_smSongReadySubscribed) {
+        _smSongReadyUnsubscribe = _smSubscribeFeedBackEvent('song:ready', () => {
+            _smSections = [];
+            _smDuration = 0;
+            _smSectionDifficulty = {};
+            _smUpdate();
+        });
+        _smSongReadySubscribed = typeof _smSongReadyUnsubscribe === 'function';
+    }
+
+    _smInitializeDifficultyListener();
+    if (_smDynamicDifficultyAvailable && !_smDifficultySubscribed) {
+        _smDifficultyUnsubscribe = _smSubscribeFeedBackEvent('difficulty:sections-updated', (event) => {
             const { sectionDifficulties } = event.detail || {};
             if (sectionDifficulties) {
                 _smSectionDifficulty = sectionDifficulties;
-                // Trigger re-render with new difficulty data
                 _smRender();
             }
         });
+        _smDifficultySubscribed = typeof _smDifficultyUnsubscribe === 'function';
     }
+}
+
+function _smStopRealtimeHooks() {
+    if (_smPoller) {
+        clearInterval(_smPoller);
+        _smPoller = null;
+    }
+
+    if (typeof _smSongReadyUnsubscribe === 'function') {
+        _smSongReadyUnsubscribe();
+    }
+    _smSongReadyUnsubscribe = null;
+    _smSongReadySubscribed = false;
+
+    if (typeof _smDifficultyUnsubscribe === 'function') {
+        _smDifficultyUnsubscribe();
+    }
+    _smDifficultyUnsubscribe = null;
+    _smDifficultySubscribed = false;
+}
+
+function _smSetPlayerVisible(isVisible) {
+    _smPlayerVisible = !!isVisible;
+    if (_smPlayerVisible) {
+        _smStartRealtimeHooks();
+        _smCreate();
+        return;
+    }
+
+    _smStopRealtimeHooks();
+    _smRemove();
 }
 
 function _smCreate() {
@@ -256,7 +315,7 @@ if (typeof module !== 'undefined' && module.exports) {
         _smGetColor, _smFmt, _smCreate, _smRemove, _smUpdate, _smRender,
         _smOnClick, _smOnWheel,
         _smIsDynamicDifficultyAvailable, _smGetSectionDifficulty, _smRenderGlassFilling,
-        _smInitializeDifficultyListener,
+        _smInitializeDifficultyListener, _smStartRealtimeHooks, _smStopRealtimeHooks, _smSetPlayerVisible,
         _getState: () => ({ bar: _smBar, sections: _smSections, duration: _smDuration, sectionDifficulty: _smSectionDifficulty, ddAvailable: _smDynamicDifficultyAvailable }),
         _setState(next) {
             if ('sections' in next) _smSections = next.sections;
@@ -264,6 +323,12 @@ if (typeof module !== 'undefined' && module.exports) {
             if ('bar' in next) _smBar = next.bar;
             if ('sectionDifficulty' in next) _smSectionDifficulty = next.sectionDifficulty;
             if ('ddAvailable' in next) _smDynamicDifficultyAvailable = next.ddAvailable;
+            if ('poller' in next) _smPoller = next.poller;
+            if ('playerVisible' in next) _smPlayerVisible = next.playerVisible;
+            if ('songReadyUnsubscribe' in next) _smSongReadyUnsubscribe = next.songReadyUnsubscribe;
+            if ('difficultyUnsubscribe' in next) _smDifficultyUnsubscribe = next.difficultyUnsubscribe;
+            if ('songReadySubscribed' in next) _smSongReadySubscribed = next.songReadySubscribed;
+            if ('difficultySubscribed' in next) _smDifficultySubscribed = next.difficultySubscribed;
         },
     };
 } else {
@@ -277,12 +342,6 @@ if (typeof module !== 'undefined' && module.exports) {
     if (window[HOOK_KEY]) return;
     window[HOOK_KEY] = true;
 
-    // Initialize difficulty listener if dynamic-difficulty is available
-    _smInitializeDifficultyListener();
-
-    // Poll for updates
-    setInterval(_smUpdate, 200);
-
     // Hook into playSong
     const origPlaySong = window.playSong;
     window.playSong = async function(filename, arrangement) {
@@ -291,13 +350,13 @@ if (typeof module !== 'undefined' && module.exports) {
         _smDuration = 0;
         _smSectionDifficulty = {};
         await origPlaySong(filename, arrangement);
-        _smCreate();
+        if (_smPlayerVisible) _smCreate();
     };
 
     // Clean up when leaving player
     const origShowScreen = window.showScreen;
     window.showScreen = function(id) {
-        if (id !== 'player') _smRemove();
+        _smSetPlayerVisible(id === 'player');
         origShowScreen(id);
     };
 })();
