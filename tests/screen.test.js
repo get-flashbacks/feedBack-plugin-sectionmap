@@ -296,3 +296,48 @@ test('_smSetPlayerVisible(false) stops polling so inactive screens do not tick _
         else global.highway = originalHighway;
     }
 });
+
+
+test('_smSetPlayerVisible retries event subscription after feedBack becomes available', () => {
+    const mod = freshPlugin();
+    const originalSetInterval = global.setInterval;
+    const originalClearInterval = global.clearInterval;
+    const originalHighway = global.highway;
+    const originalFeedBack = global.window.feedBack;
+    let intervalId = 0;
+    let onCalls = 0;
+    let unsubscribeCalls = 0;
+
+    global.highway = {
+        getSections: () => [],
+        getSongInfo: () => ({ duration: 0 }),
+        getTime: () => 0,
+    };
+    delete global.window.feedBack;
+    global.setInterval = () => ++intervalId;
+    global.clearInterval = () => {};
+
+    try {
+        mod._smSetPlayerVisible(true);
+        global.window.feedBack = {
+            on: () => {
+                onCalls++;
+                return () => { unsubscribeCalls++; };
+            },
+        };
+
+        mod._smSetPlayerVisible(true);
+        assert.equal(onCalls, 1);
+
+        mod._smSetPlayerVisible(false);
+        assert.equal(unsubscribeCalls, 1);
+    } finally {
+        mod._smSetPlayerVisible(false);
+        global.setInterval = originalSetInterval;
+        global.clearInterval = originalClearInterval;
+        if (typeof originalHighway === 'undefined') delete global.highway;
+        else global.highway = originalHighway;
+        if (typeof originalFeedBack === 'undefined') delete global.window.feedBack;
+        else global.window.feedBack = originalFeedBack;
+    }
+});
