@@ -328,7 +328,7 @@ function _smEscapeHtml(value) {
 }
 
 // Node-only export hook for tests; browsers fall through to the side-effect
-// IIFE below (poller + playSong/showScreen wrapping).
+// IIFE below (poller + playSong wrapping + screen:changed listener).
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         _smGetColor, _smFmt, _smCreate, _smRemove, _smUpdate, _smRender,
@@ -352,10 +352,11 @@ if (typeof module !== 'undefined' && module.exports) {
     };
 } else {
 
-// Side effects: poller + playSong/showScreen wrappers. Consolidated under
-// one idempotency guard so re-evaluation (loader cache miss, hot reload,
-// older core builds without the load-side guard) doesn't start a second
-// 5Hz poller and doesn't grow either wrapper chain.
+// Side effects: poller + playSong wrapper + screen:changed listener.
+// Consolidated under one idempotency guard so re-evaluation (loader cache
+// miss, hot reload, older core builds without the load-side guard) doesn't
+// start a second 5Hz poller and doesn't grow the wrapper chain or add a
+// second event listener.
 (function() {
     const HOOK_KEY = '__slopsmithSectionMapHooksInstalled';
     if (window[HOOK_KEY]) return;
@@ -372,12 +373,17 @@ if (typeof module !== 'undefined' && module.exports) {
         if (_smPlayerVisible) _smCreate();
     };
 
-    // Clean up when leaving player
-    const origShowScreen = window.showScreen;
-    window.showScreen = function(id) {
-        _smSetPlayerVisible(id === 'player');
-        origShowScreen(id);
-    };
+    // Mount/unmount as the player screen activates/deactivates. Core's internal
+    // navigation (playSong, closeCurrentSong, …) calls its own imported
+    // showScreen() directly rather than window.showScreen — monkey-patching
+    // window.showScreen here would silently never fire (feedBack#923/#924: the
+    // same fragility across three different callers is why core moved to
+    // firing screen:changed/screen:changing on window.feedBack instead of
+    // letting plugins patch the global). Listen for the event core actually
+    // emits rather than a global it no longer calls through.
+    _smSubscribeFeedBackEvent('screen:changed', (event) => {
+        _smSetPlayerVisible((event.detail && event.detail.id) === 'player');
+    });
 })();
 
 }

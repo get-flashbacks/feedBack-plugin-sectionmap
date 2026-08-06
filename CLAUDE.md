@@ -9,12 +9,19 @@ reading state straight off the Host's `window.highway` object.
 
 - **Folder name must equal `plugin.json`'s `id` exactly** (case-sensitive:
   `section_map`) — a mismatch is a silent skip at plugin discovery.
-- **Idempotent script guard, already in place:** the `playSong`/`showScreen`
-  wrapping and the `setInterval` poller are all installed inside a single
-  `window.__slopsmithSectionMapHooksInstalled` guard at the bottom of
-  `screen.js`. The Host may re-execute `screen.js` on plugin reload — any
-  new top-level listener/timer needs to go inside that same guard, not a
-  bare call alongside it.
+- **Idempotent script guard, already in place:** the `playSong` wrapping,
+  the `screen:changed` listener, and the `setInterval` poller are all
+  installed inside a single `window.__slopsmithSectionMapHooksInstalled`
+  guard at the bottom of `screen.js`. The Host may re-execute `screen.js` on
+  plugin reload — any new top-level listener/timer needs to go inside that
+  same guard, not a bare call alongside it.
+- **Mount/unmount tracks the player screen via the `screen:changed` event on
+  `window.feedBack`, NOT by monkey-patching `window.showScreen`.** Core's own
+  internal navigation (`playSong`, `closeCurrentSong`, …) calls its own
+  imported `showScreen()` directly and never touches `window.showScreen` —
+  see `feedBack/static/js/session.js`'s comment on `showScreen()` re:
+  feedBack#923/#924. Patching `window.showScreen` here would silently never
+  fire for real navigation; this was an actual regression until fixed.
 - **No bespoke API with `feedback-plugin-dynamic-difficulty`.** Both plugins
   independently read the same Host surface (`highway.getPhrases()` /
   `hasPhraseData()` / `getMastery()`) for section-difficulty data — this
