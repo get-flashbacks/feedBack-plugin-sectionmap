@@ -1,6 +1,6 @@
 # feedBack Plugin: Section Map
 
-A plugin for [feedBack](https://github.com/get-flashbacks/feedBack) that shows a minimap bar of the full song structure at the top of the player. Click any section to jump to it.
+A plugin for [feedBack](https://github.com/got-feedBack/feedBack) that shows a minimap bar of the full song structure at the top of the player. Click any section to jump to it.
 
 ## Features
 
