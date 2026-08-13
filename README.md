@@ -14,7 +14,7 @@ A plugin for [feedBack](https://github.com/got-feedBack/feedBack) that shows a m
 
 ```bash
 cd /path/to/feedBack/plugins
-git clone https://github.com/get-flashbacks/feedBack-plugin-sectionmap.git section_map
+git clone https://github.com/got-feedBack/feedBack-plugin-sectionmap.git section_map
 docker compose restart
 ```
 
