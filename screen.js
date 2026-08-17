@@ -14,6 +14,16 @@ let _smDifficultyUnsubscribe = null;
 let _smSongReadySubscribed = false;
 let _smDifficultySubscribed = false;
 
+// Cached DOM refs for the 5Hz poller, populated by _smRender() (which runs
+// only when the section list itself changes) and invalidated by _smRemove().
+// Lets _smUpdate() avoid a fresh querySelectorAll('.sm-block')/getElementById
+// pass on every single tick.
+let _smMarkerEl = null;
+let _smBlockEls = [];
+// Index of the block last marked "active" (opacity 1), or -1 when unknown
+// (forces the next tick to (re)apply opacity instead of assuming default).
+let _smActiveIdx = -1;
+
 // Most-specific-first: 'pre' must come before 'chorus'/'verse' so a
 // "pre-chorus"/"pre-verse" section name (which contains both substrings)
 // matches its own color instead of falling through to the base section's.
@@ -89,7 +99,18 @@ function _smStartRealtimeHooks() {
             const { sectionDifficulties } = event.detail || {};
             if (sectionDifficulties) {
                 _smSectionDifficulty = sectionDifficulties;
-                _smRender();
+                // Difficulty refreshes change only the per-section glass fill,
+                // not colors/labels/positions — update those in place rather
+                // than paying for a full _smRender() (which tears down and
+                // rebuilds every block's DOM) on every event, which can fire
+                // repeatedly over the course of a song. Falls back to a full
+                // render if the cached blocks don't match the current
+                // section list (bar not built for these sections yet).
+                if (_smBar && _smSections.length > 0 && _smBlockEls.length === _smSections.length) {
+                    _smUpdateDifficultyFills();
+                } else {
+                    _smRender();
+                }
             }
         });
         _smDifficultySubscribed = typeof _smDifficultyUnsubscribe === 'function';
@@ -148,6 +169,9 @@ function _smRemove() {
         _smBar.remove();
         _smBar = null;
     }
+    _smMarkerEl = null;
+    _smBlockEls = [];
+    _smActiveIdx = -1;
 }
 
 // The playback clock, across whichever backend is driving audio. getTime() is
@@ -230,23 +254,33 @@ function _smUpdate() {
         _smRender();
     }
 
-    // Update playback position indicator
-    const marker = document.getElementById('sm-marker');
-    if (marker && _smDuration > 0) {
+    // Update playback position indicator. _smMarkerEl is cached by _smRender()
+    // so this is a style write, not a fresh getElementById lookup every 200ms.
+    if (_smMarkerEl && _smDuration > 0) {
         const pct = (t / _smDuration) * 100;
-        marker.style.left = pct + '%';
+        _smMarkerEl.style.left = pct + '%';
     }
 
-    // Highlight active section
-    const blocks = _smBar.querySelectorAll('.sm-block');
+    // Highlight active section. _smBlockEls is cached by _smRender() (rebuilt
+    // only when the section list changes), and blocks start at opacity 0.5
+    // (baked into the render template), so a tick only needs to touch the
+    // two blocks whose highlight state actually flipped instead of doing a
+    // querySelectorAll + full forEach opacity rewrite every 200ms regardless
+    // of whether the active section changed since the last tick.
     let activeIdx = 0;
     for (let i = 0; i < _smSections.length; i++) {
         if (_smSections[i].time <= t) activeIdx = i;
         else break;
     }
-    blocks.forEach((block, i) => {
-        block.style.opacity = i === activeIdx ? '1' : '0.5';
-    });
+    if (activeIdx !== _smActiveIdx) {
+        if (_smActiveIdx >= 0 && _smBlockEls[_smActiveIdx]) {
+            _smBlockEls[_smActiveIdx].style.opacity = '0.5';
+        }
+        if (_smBlockEls[activeIdx]) {
+            _smBlockEls[activeIdx].style.opacity = '1';
+        }
+        _smActiveIdx = activeIdx;
+    }
 }
 
 function _smRender() {
@@ -278,7 +312,11 @@ function _smRender() {
 
         const safeLabel = _smEscapeHtml(label);
         const safeTitle = _smEscapeHtml(`${titleLabel} (${_smFmt(sec.time)})`);
-        html += `<div class="sm-block" style="position:absolute;left:${startPct}%;width:${widthPct}%;top:0;bottom:0;background:${color};border-right:1px solid rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;overflow:hidden;transition:opacity 0.15s;"
+        // opacity starts at 0.5 (the "inactive" state) so _smUpdate's per-tick
+        // highlight pass only ever needs to touch the blocks whose active
+        // state actually changed, instead of rewriting every block's opacity
+        // on every poll.
+        html += `<div class="sm-block" style="position:absolute;left:${startPct}%;width:${widthPct}%;top:0;bottom:0;background:${color};border-right:1px solid rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;overflow:hidden;transition:opacity 0.15s;opacity:0.5;"
             title="${safeTitle}">
             ${difficultyContent}
             <span style="font-size:9px;color:rgba(255,255,255,0.8);white-space:nowrap;text-overflow:ellipsis;overflow:hidden;padding:0 3px;">${safeLabel}</span>
@@ -290,6 +328,12 @@ function _smRender() {
 
     _smBar.innerHTML = html;
     _smBar.style.position = 'relative';
+
+    // Re-cache the DOM refs _smUpdate()'s per-tick highlight/marker pass
+    // reads, since the innerHTML rebuild just invalidated the old ones.
+    _smMarkerEl = _smBar.querySelector ? _smBar.querySelector('#sm-marker') : null;
+    _smBlockEls = _smBar.querySelectorAll ? Array.from(_smBar.querySelectorAll('.sm-block')) : [];
+    _smActiveIdx = -1;
 }
 
 // Render glass-filling visualization for section difficulty
@@ -308,10 +352,50 @@ function _smRenderGlassFilling(difficulty) {
 
     const glassStyle = sizeStyles[glassSize] || sizeStyles.medium;
 
-    return `<div style="position:relative;${glassStyle}margin-right:4px;background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.4);border-radius:2px;display:flex;align-items:flex-end;overflow:hidden;"
+    // Classed (and size-tagged) so _smUpdateDifficultyFills() can update an
+    // existing glass's fill height/title in place on a difficulty refresh,
+    // instead of the caller having to rebuild the whole section-map bar just
+    // to redraw it.
+    return `<div class="sm-glass" data-size="${glassSize}" style="position:relative;${glassStyle}margin-right:4px;background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.4);border-radius:2px;display:flex;align-items:flex-end;overflow:hidden;"
         title="Difficulty: ${fillPct.toFixed(0)}%">
-        <div style="width:100%;height:${fillPct}%;background:rgba(255,200,100,0.7);transition:height 0.3s ease;"></div>
+        <div class="sm-glass-fill" style="width:100%;height:${fillPct}%;background:rgba(255,200,100,0.7);transition:height 0.3s ease;"></div>
     </div>`;
+}
+
+// Refresh only the per-section difficulty "glass fill" indicators in place
+// (fill height + title) instead of rebuilding the whole section-map bar.
+// Called from the 'difficulty:sections-updated' event, which can fire
+// repeatedly while a song plays as dynamic-difficulty tracks accuracy — none
+// of that data changes section colors/labels/positions, so a full _smRender()
+// on every event would tear down and rebuild every block's DOM just to
+// repaint a handful of small fill bars.
+function _smUpdateDifficultyFills() {
+    if (!_smBar || !_smBlockEls.length) return;
+    for (let i = 0; i < _smBlockEls.length; i++) {
+        const block = _smBlockEls[i];
+        if (!block || typeof block.querySelector !== 'function') continue;
+        const difficulty = _smGetSectionDifficulty(i);
+        const glass = block.querySelector('.sm-glass');
+        if (_smDynamicDifficultyAvailable && difficulty && typeof difficulty.fillPercentage === 'number') {
+            const fillPct = Math.max(0, Math.min(100, difficulty.fillPercentage));
+            const glassSize = difficulty.glassSize || 'medium';
+            const sizeChanged = glass && glass.getAttribute && glass.getAttribute('data-size') !== glassSize;
+            if (glass && !sizeChanged) {
+                // Same glass already present (the common case while a song
+                // plays) — just update its fill height and title.
+                glass.title = `Difficulty: ${fillPct.toFixed(0)}%`;
+                const fillEl = glass.querySelector('.sm-glass-fill');
+                if (fillEl) fillEl.style.height = fillPct + '%';
+            } else {
+                // No glass yet, or its size bucket changed — (re)build just
+                // this one glass element rather than the whole bar.
+                if (glass) glass.remove();
+                block.insertAdjacentHTML('afterbegin', _smRenderGlassFilling(difficulty));
+            }
+        } else if (glass) {
+            glass.remove();
+        }
+    }
 }
 
 function _smFmt(s) {
@@ -334,8 +418,12 @@ if (typeof module !== 'undefined' && module.exports) {
         _smGetColor, _smFmt, _smCreate, _smRemove, _smUpdate, _smRender,
         _smOnClick, _smOnWheel, _smEscapeHtml,
         _smIsDynamicDifficultyAvailable, _smGetSectionDifficulty, _smRenderGlassFilling,
+        _smUpdateDifficultyFills,
         _smInitializeDifficultyListener, _smStartRealtimeHooks, _smStopRealtimeHooks, _smSetPlayerVisible,
-        _getState: () => ({ bar: _smBar, sections: _smSections, duration: _smDuration, sectionDifficulty: _smSectionDifficulty, ddAvailable: _smDynamicDifficultyAvailable }),
+        _getState: () => ({
+            bar: _smBar, sections: _smSections, duration: _smDuration, sectionDifficulty: _smSectionDifficulty,
+            ddAvailable: _smDynamicDifficultyAvailable, markerEl: _smMarkerEl, blockEls: _smBlockEls, activeIdx: _smActiveIdx,
+        }),
         _setState(next) {
             if ('sections' in next) _smSections = next.sections;
             if ('duration' in next) _smDuration = next.duration;
@@ -348,6 +436,9 @@ if (typeof module !== 'undefined' && module.exports) {
             if ('difficultyUnsubscribe' in next) _smDifficultyUnsubscribe = next.difficultyUnsubscribe;
             if ('songReadySubscribed' in next) _smSongReadySubscribed = next.songReadySubscribed;
             if ('difficultySubscribed' in next) _smDifficultySubscribed = next.difficultySubscribed;
+            if ('markerEl' in next) _smMarkerEl = next.markerEl;
+            if ('blockEls' in next) _smBlockEls = next.blockEls;
+            if ('activeIdx' in next) _smActiveIdx = next.activeIdx;
         },
     };
 } else {
