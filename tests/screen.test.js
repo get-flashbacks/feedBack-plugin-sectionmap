@@ -306,6 +306,151 @@ test('_smSetPlayerVisible(false) stops polling so inactive screens do not tick _
 });
 
 
+// _smRender bakes opacity:0.5 into every block up front so _smUpdate's
+// per-tick highlight pass never needs a querySelectorAll/forEach sweep —
+// it only ever touches the (at most two) blocks whose active state flipped.
+
+test('_smRender bakes opacity:0.5 into every block', () => {
+    const mod = freshPlugin();
+    const bar = new FakeBar();
+    mod._setState({
+        bar,
+        sections: [{ name: 'Intro', time: 0 }, { name: 'Verse 1', time: 10 }, { name: 'Chorus', time: 20 }],
+        duration: 30,
+    });
+    mod._smRender();
+    assert.equal((bar.innerHTML.match(/opacity:0\.5/g) || []).length, 3);
+});
+
+test('_smUpdate only touches the blocks whose active state changed, leaving cached blockEls alone otherwise', () => {
+    const mod = freshPlugin();
+    const originalHighway = global.highway;
+    const sections = [{ name: 'Intro', time: 0 }, { name: 'Verse 1', time: 10 }, { name: 'Chorus', time: 20 }];
+    const blockEls = sections.map(() => ({ style: {} }));
+    const markerEl = { style: {} };
+    let t = 0;
+    global.highway = {
+        getSections: () => sections,
+        getSongInfo: () => ({ duration: 30 }),
+        getTime: () => t,
+    };
+    try {
+        // Same `sections` reference as highway.getSections() returns, so
+        // _smUpdate's "only rebuild if sections changed" check skips
+        // _smRender() and our injected blockEls/markerEl survive untouched.
+        mod._setState({ bar: new FakeBar(), sections, duration: 30, blockEls, markerEl, activeIdx: -1 });
+
+        mod._smUpdate();
+        assert.equal(blockEls[0].style.opacity, '1');
+        assert.equal(blockEls[1].style.opacity, undefined);
+        assert.equal(blockEls[2].style.opacity, undefined);
+        assert.equal(markerEl.style.left, '0%');
+
+        t = 15;
+        mod._smUpdate();
+        assert.equal(blockEls[0].style.opacity, '0.5', 'previous active block reverts to inactive');
+        assert.equal(blockEls[1].style.opacity, '1', 'newly active block is highlighted');
+        assert.equal(blockEls[2].style.opacity, undefined, 'never-active block is left untouched');
+        assert.equal(markerEl.style.left, '50%');
+    } finally {
+        if (typeof originalHighway === 'undefined') delete global.highway;
+        else global.highway = originalHighway;
+    }
+});
+
+// _smUpdateDifficultyFills updates an existing glass in place (no DOM
+// rebuild) on a difficulty refresh, only rebuilding the one glass element
+// when its size bucket changes, per its own doc comment.
+
+class FakeGlassFill {
+    constructor() { this.style = {}; }
+}
+
+class FakeGlass {
+    constructor(size, fillPct) {
+        this._size = size;
+        this.title = `Difficulty: ${fillPct}%`;
+        this.removed = false;
+        this._fill = new FakeGlassFill();
+        this._fill.style.height = fillPct + '%';
+    }
+    getAttribute(name) { return name === 'data-size' ? this._size : null; }
+    querySelector(sel) { return sel === '.sm-glass-fill' ? this._fill : null; }
+    remove() { this.removed = true; }
+}
+
+class FakeDifficultyBlock {
+    constructor(glass) {
+        this._glass = glass || null;
+        this.insertedHTML = [];
+    }
+    querySelector(sel) { return sel === '.sm-glass' ? this._glass : null; }
+    insertAdjacentHTML(_pos, html) {
+        this.insertedHTML.push(html);
+        const sizeMatch = html.match(/data-size="(\w+)"/);
+        const fillMatch = html.match(/height:([\d.]+)%/);
+        const titleMatch = html.match(/title="([^"]*)"/);
+        const glass = new FakeGlass(sizeMatch ? sizeMatch[1] : 'medium', fillMatch ? fillMatch[1] : '0');
+        if (titleMatch) glass.title = titleMatch[1];
+        this._glass = glass;
+    }
+}
+
+test('_smUpdateDifficultyFills updates an existing glass fill/title in place without rebuilding it', () => {
+    const mod = freshPlugin();
+    const glass = new FakeGlass('medium', 10);
+    const block = new FakeDifficultyBlock(glass);
+    mod._setState({
+        bar: new FakeBar(),
+        blockEls: [block],
+        sectionDifficulty: [{ fillPercentage: 40, glassSize: 'medium' }],
+        ddAvailable: true,
+    });
+
+    mod._smUpdateDifficultyFills();
+
+    assert.equal(block._glass, glass, 'same glass element reused, not rebuilt');
+    assert.equal(glass.removed, false);
+    assert.equal(block.insertedHTML.length, 0);
+    assert.equal(glass._fill.style.height, '40%');
+    assert.equal(glass.title, 'Difficulty: 40%');
+});
+
+test('_smUpdateDifficultyFills rebuilds the glass when its size bucket changes', () => {
+    const mod = freshPlugin();
+    const glass = new FakeGlass('small', 10);
+    const block = new FakeDifficultyBlock(glass);
+    mod._setState({
+        bar: new FakeBar(),
+        blockEls: [block],
+        sectionDifficulty: [{ fillPercentage: 75, glassSize: 'large' }],
+        ddAvailable: true,
+    });
+
+    mod._smUpdateDifficultyFills();
+
+    assert.equal(glass.removed, true, 'old size-mismatched glass is discarded');
+    assert.equal(block.insertedHTML.length, 1);
+    assert.notEqual(block._glass, glass, 'a fresh glass element replaces it');
+    assert.equal(block._glass.title, 'Difficulty: 75%');
+});
+
+test('_smUpdateDifficultyFills removes a stale glass once difficulty data is no longer available', () => {
+    const mod = freshPlugin();
+    const glass = new FakeGlass('medium', 10);
+    const block = new FakeDifficultyBlock(glass);
+    mod._setState({
+        bar: new FakeBar(),
+        blockEls: [block],
+        sectionDifficulty: [],
+        ddAvailable: true,
+    });
+
+    mod._smUpdateDifficultyFills();
+
+    assert.equal(glass.removed, true);
+});
+
 test('_smSetPlayerVisible retries event subscription after feedBack becomes available', () => {
     const mod = freshPlugin();
     const originalSetInterval = global.setInterval;
