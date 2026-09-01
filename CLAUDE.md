@@ -22,13 +22,23 @@ reading state straight off the Host's `window.highway` object.
   see `feedBack/static/js/session.js`'s comment on `showScreen()` re:
   feedBack#923/#924. Patching `window.showScreen` here would silently never
   fire for real navigation; this was an actual regression until fixed.
-- **No bespoke API with `feedback-plugin-dynamic-difficulty`.** Both plugins
-  independently read the same Host surface (`highway.getPhrases()` /
-  `hasPhraseData()` / `getMastery()`) for section-difficulty data — this
-  plugin works whether or not dynamic_difficulty is installed, as long as
-  *something* populates that phrase data. Don't reach into
-  dynamic_difficulty's own globals/localStorage directly; go through
-  `window.highway`.
+- **Section-difficulty data comes from `difficulty_ladder`'s
+  `difficulty:sections-updated` event, not independent `highway` reads
+  (issue #63).** This plugin used to independently read `highway.getPhrases()`
+  / `hasPhraseData()` / `getMastery()` for section-difficulty data — that
+  changed when the glass-fill rendering was rewritten to consume
+  `difficulty_ladder`'s emitted event instead (`_smUpdateDifficultyFills` /
+  `_smGetSectionDifficulty` just render whatever `fillPercentage` /
+  `glassSize` the event's payload carries per section). This plugin still
+  works standalone with no ladder plugin installed — `_smIsDynamicDifficultyAvailable()`
+  gates the subscription on `window._ddCapabilities`, absent means no
+  glasses are shown, not an error — but when a ladder plugin *is* installed,
+  this is the API, not a coincidence of both sides reading the same Host
+  state. See `difficulty_ladder`'s `INTEGRATION.md` for the full contract
+  (fill formula, fallback/timing behavior). Load order matters: plugins load
+  alphabetically, so `difficulty_ladder` (< `section_map`) sets
+  `window._ddCapabilities` before this plugin's one-time availability check
+  runs.
 - **Seeking must go through the Host's canonical funnel**
   (`window.feedBack.seek` / `window.slopsmith.seek`, wrapped by `_smSeek`),
   not by poking `audio.currentTime` directly — see the comment on `_smSeek`

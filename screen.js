@@ -49,12 +49,17 @@ function _smGetColor(name) {
     return SM_COLORS.default;
 }
 
-// Check if dynamic-difficulty plugin is installed and available
+// Check if the difficulty_ladder plugin (formerly "dynamic-difficulty") is
+// installed and available. `window._ddCapabilities` is the compatibility
+// marker it sets at load time (see difficulty_ladder's screen.js and
+// INTEGRATION.md, issue #63) -- the marker name predates that plugin's
+// rename from `dynamic_difficulty` to `difficulty_ladder`, kept as-is since
+// it's the established capability-marker contract between the two plugins.
+// (A second check here used to also probe `window.feedBackViz_dynamic_difficulty`,
+// a viz-factory-naming-convention global difficulty_ladder never actually
+// set even before the rename -- dead since this function was written.)
 function _smIsDynamicDifficultyAvailable() {
     if (typeof window.feedBack === 'undefined') return false;
-    // Check if dynamic-difficulty is in the active plugins list or has exposed a capability
-    if (typeof window.feedBackViz_dynamic_difficulty !== 'undefined') return true;
-    // Additional check: look for dynamic-difficulty's global scope if available
     if (typeof window._ddCapabilities !== 'undefined') return true;
     return false;
 }
