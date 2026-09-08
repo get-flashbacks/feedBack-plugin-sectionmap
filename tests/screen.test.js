@@ -396,6 +396,48 @@ test('_smUpdate clears a stale bar/state once the current song has no section da
     }
 });
 
+test('_smUpdate clears the bar even when song:ready already zeroed _smSections first', () => {
+    // The song:ready handler (installed in _smStartRealtimeHooks) sets
+    // _smSections = [] itself and THEN calls _smUpdate() directly -- so on
+    // that path _smSections is already empty by the time _smUpdate's guard
+    // runs. Gating the clear on `_smSections.length > 0` (the original fix)
+    // made it a no-op on exactly this path: the bar's stale rendered blocks
+    // and cached marker/block-el refs never got cleared. This test
+    // reproduces that ordering directly (bypassing the real event
+    // subscription) and asserts the bar clears anyway.
+    const mod = freshPlugin();
+    const originalHighway = global.highway;
+    const bar = new FakeBar();
+    bar.innerHTML = '<div class="sm-block">Intro</div>';
+    const staleBlockEl = { style: {} };
+    const staleMarkerEl = { style: {} };
+    try {
+        global.highway = {
+            getSections: () => [],
+            getSongInfo: () => ({ duration: 200 }),
+            getTime: () => 0,
+        };
+        // Mirrors song:ready's own reset (sections already []) landing
+        // just before _smUpdate() is called, while the bar DOM/cached
+        // refs from the PREVIOUS song are still live.
+        mod._setState({
+            bar, sections: [], duration: 0,
+            blockEls: [staleBlockEl], markerEl: staleMarkerEl, activeIdx: 0,
+        });
+
+        mod._smUpdate();
+
+        const state = mod._getState();
+        assert.equal(bar.innerHTML, '', 'stale blocks must clear even though _smSections was already []');
+        assert.equal(state.markerEl, null);
+        assert.deepEqual(state.blockEls, []);
+        assert.equal(state.activeIdx, -1);
+    } finally {
+        if (typeof originalHighway === 'undefined') delete global.highway;
+        else global.highway = originalHighway;
+    }
+});
+
 // _smUpdateDifficultyFills updates an existing glass in place (no DOM
 // rebuild) on a difficulty refresh, only rebuilding the one glass element
 // when its size bucket changes, per its own doc comment.
