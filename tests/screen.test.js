@@ -358,6 +358,44 @@ test('_smUpdate only touches the blocks whose active state changed, leaving cach
     }
 });
 
+test('_smUpdate clears a stale bar/state once the current song has no section data', () => {
+    const mod = freshPlugin();
+    const originalHighway = global.highway;
+    const bar = new FakeBar();
+    const sections = [{ name: 'Intro', time: 0 }, { name: 'Chorus', time: 30 }];
+    try {
+        global.highway = {
+            getSections: () => sections,
+            getSongInfo: () => ({ duration: 120 }),
+            getTime: () => 5,
+        };
+        mod._setState({ bar, sections: [], duration: 0 });
+        mod._smUpdate();
+        assert.ok(bar.innerHTML.includes('Intro'), 'sanity: first song rendered');
+
+        // Switch to a song/arrangement with no section data WITHOUT going
+        // through _smRemove() (mirrors a core re-stream that bypasses the
+        // playSong wrapper, e.g. an in-player arrangement switch, or any
+        // path that skips the wrapper's own state reset).
+        global.highway.getSections = () => [];
+        global.highway.getSongInfo = () => ({ duration: 200 });
+        mod._smUpdate();
+
+        const state = mod._getState();
+        assert.deepEqual(state.sections, []);
+        assert.equal(state.duration, 0);
+        assert.equal(state.activeIdx, -1);
+        assert.equal(bar.innerHTML, '', 'stale blocks from the previous song must not linger');
+
+        // A further tick with still-no-sections is a no-op, not a rebuild.
+        mod._smUpdate();
+        assert.equal(bar.innerHTML, '');
+    } finally {
+        if (typeof originalHighway === 'undefined') delete global.highway;
+        else global.highway = originalHighway;
+    }
+});
+
 // _smUpdateDifficultyFills updates an existing glass in place (no DOM
 // rebuild) on a difficulty refresh, only rebuilding the one glass element
 // when its size bucket changes, per its own doc comment.
