@@ -53,6 +53,8 @@ reading state straight off the Host's `window.highway` object.
 
 Bump `version` in `plugin.json` whenever a change is user-visible — a
 rendering fix, a new interaction (click/wheel/hover), a changed setting
-(best-practices rule 4: bump on every release; the plugin manager uses
-this to detect updates). Patch (`1.x.y`) for fixes, minor (`1.x.0`) for
-new features, matching normal semver conventions.
+(best-practices rule 4: bump on every release — the version is used for
+cache-busting the served JS/CSS URL, so an unbumped version means users
+keep getting stale cached files after an update). Patch (`1.x.y`) for
+fixes, minor (`1.x.0`) for new features, matching normal semver
+conventions.
