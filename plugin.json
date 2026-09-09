@@ -1,7 +1,7 @@
 {
   "id": "section_map",
   "name": "Section Map",
-  "version": "1.2.5",
+  "version": "1.2.7",
   "private": false,
   "script": "screen.js",
   "category": "practice",

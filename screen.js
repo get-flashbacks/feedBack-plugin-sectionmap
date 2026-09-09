@@ -249,7 +249,39 @@ function _smUpdate() {
     const info = highway.getSongInfo();
     const t = highway.getTime();
 
-    if (!sections || sections.length === 0 || !info.duration) return;
+    if (!sections || sections.length === 0 || !info.duration) {
+        // The previous song's bar must not linger once the CURRENT song has
+        // no section data. This early-return used to bail before touching
+        // any state, so switching to a song/arrangement with no sections
+        // (a GP import, or a core re-stream that bypasses the playSong
+        // wrapper's own reset -- e.g. an in-player arrangement switch) left
+        // the old blocks painted and the marker/active-highlight frozen at
+        // wherever the last real song left them.
+        //
+        // Gate on the bar's actual painted content, NOT _smSections: the
+        // song:ready handler above already sets _smSections = [] itself
+        // before calling _smUpdate() directly, so by the time this runs
+        // _smSections.length is already 0 on exactly the transition this
+        // guard exists to catch -- gating on it made the clear a no-op on
+        // that path, since a bar with stale rendered blocks would report
+        // "nothing to clear". _smBar.innerHTML is only ever set by
+        // _smRender() and only ever emptied by _smRemove() or this same
+        // block, so it accurately tracks whether the bar still shows
+        // painted content regardless of which path zeroed _smSections
+        // first. Clearing is idempotent, so this still bails immediately
+        // on every later tick once already cleared, rather than rebuilding
+        // an already-empty bar every 200ms while no song/sections are loaded.
+        if (_smBar.innerHTML !== '') {
+            _smSections = [];
+            _smDuration = 0;
+            _smSectionDifficulty = {};
+            _smBar.innerHTML = '';
+            _smMarkerEl = null;
+            _smBlockEls = [];
+            _smActiveIdx = -1;
+        }
+        return;
+    }
 
     _smDuration = info.duration;
 
