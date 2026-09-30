@@ -32,7 +32,7 @@ jobs:
   version-bumped-on-change:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: plugin.json version must bump when functional source changes
@@ -74,7 +74,7 @@ jobs:
   idempotent-top-level-guard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Top-level listeners/timers must be inside a reload guard
         run: |
           python3 - <<'PY'
@@ -117,7 +117,7 @@ jobs:
   changelog-updated:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: CHANGELOG.md Unreleased section must be updated for functional changes
