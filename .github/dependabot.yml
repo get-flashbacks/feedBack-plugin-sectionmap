@@ -1,0 +1,17 @@
+# Group minor/patch version updates to limit PR noise.
+# Monthly checks; major updates remain outside the minor/patch groups.
+# Groups apply to version updates, not security updates or automatic merging.
+version: 2
+updates:
+- package-ecosystem: github-actions
+  directory: /
+  schedule:
+    interval: monthly
+  open-pull-requests-limit: 5
+  groups:
+    minor-and-patch:
+      patterns:
+      - '*'
+      update-types:
+      - minor
+      - patch
