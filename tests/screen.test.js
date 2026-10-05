@@ -574,3 +574,358 @@ test('_smSetPlayerVisible retries event subscription after feedBack becomes avai
         else global.window.feedBack = originalFeedBack;
     }
 });
+
+
+// Difficulty Ladder peer contract (issue #13): absent, late-loaded, minimum, and
+// current providers, plus malformed and older payloads. The glasses are the only
+// feature that depends on the peer, so every one of these has to leave base
+// section navigation working.
+
+// Minimal stand-in for a host event bus: records (event, handler) so a test can
+// fire the peer's event exactly as the host would, and count subscriptions.
+function fakeEventBus() {
+    const handlers = new Map();
+    return {
+        calls: [],
+        on(eventName, handler) {
+            this.calls.push(eventName);
+            // Replace the list rather than mutating it: fire() captures the list
+            // when it starts, so a handler that subscribes or unsubscribes
+            // mid-dispatch can't disturb the dispatch already in progress.
+            handlers.set(eventName, (handlers.get(eventName) || []).concat(handler));
+            return () => {
+                handlers.set(eventName, (handlers.get(eventName) || []).filter((h) => h !== handler));
+            };
+        },
+        count(eventName) { return (handlers.get(eventName) || []).length; },
+        fire(eventName, event) {
+            for (const handler of handlers.get(eventName) || []) handler(event);
+        },
+    };
+}
+
+// A difficulty_ladder.sections.v2 payload, as difficulty_ladder emits it: an
+// object map keyed by section index, one entry per section that has an
+// overlapping phrase (sections with none are simply absent).
+function v2Payload(entries) {
+    return {
+        schema: 'difficulty_ladder.sections.v2',
+        sectionDifficulties: entries,
+        mastery: 0.5,
+        maxDifficulty: 4,
+    };
+}
+
+test('peer contract: no provider means no subscription and no glasses', () => {
+    const mod = freshPlugin();
+    const bus = fakeEventBus();
+    global.window.feedBack = bus;
+    assert.equal(mod._smIsDynamicDifficultyAvailable(), false);
+
+    mod._smEnsureDifficultySubscription();
+    mod._smEnsureDifficultySubscription();
+
+    assert.equal(mod._getState().ddAvailable, false);
+    assert.deepEqual(bus.calls, [], 'must not subscribe without the capability marker');
+    mod._setState({ sectionDifficulty: { 0: { fillPercentage: 50 } } });
+    assert.equal(mod._smGetSectionDifficulty(0), null, 'cached data stays unreachable while the peer is absent');
+});
+
+test('peer contract: a bare _ddCapabilities global is not a provider', () => {
+    const mod = freshPlugin();
+    const bus = fakeEventBus();
+    global.window.feedBack = bus;
+    // Some other plugin using the same global name, or a ladder build from
+    // before the v2 contract existed. Either way, no sectionDifficulty marker.
+    global.window._ddCapabilities = { somethingElse: true };
+    try {
+        assert.equal(mod._smIsDynamicDifficultyAvailable(), false);
+        mod._smEnsureDifficultySubscription();
+        assert.deepEqual(bus.calls, []);
+    } finally {
+        delete global.window._ddCapabilities;
+    }
+});
+
+test('peer contract: a late-loading provider is picked up by the next _smUpdate tick', () => {
+    // The original handshake decided once, at player-screen mount, which relied
+    // on the Host loading plugins alphabetically (difficulty_ladder <
+    // section_map). A deferred or reloaded plugin load left the feature
+    // unsubscribed for the rest of the session; the retry is the poller.
+    const mod = freshPlugin();
+    const originalHighway = global.highway;
+    const bus = fakeEventBus();
+    global.window.feedBack = bus;
+    global.highway = {
+        getSections: () => [],
+        getSongInfo: () => ({ duration: 0 }),
+        getTime: () => 0,
+    };
+    try {
+        mod._setState({ bar: new FakeBar() });
+        mod._smUpdate(); // player already visible, peer not loaded yet
+        assert.equal(bus.count('difficulty:sections-updated'), 0);
+
+        global.window._ddCapabilities = { sectionDifficulty: true };
+        mod._smUpdate();
+        assert.equal(bus.count('difficulty:sections-updated'), 1, 'subscribed on the next tick');
+
+        mod._smUpdate();
+        mod._smUpdate();
+        assert.equal(bus.count('difficulty:sections-updated'), 1, 'subscribed exactly once');
+    } finally {
+        delete global.window._ddCapabilities;
+        if (typeof originalHighway === 'undefined') delete global.highway;
+        else global.highway = originalHighway;
+    }
+});
+
+test('peer contract: a minimum (v0.12.0) provider payload renders glasses', () => {
+    // v0.12.0 is the floor: the first release documenting the v2 payload shape.
+    // It advertises sectionDifficulty and no sectionsSchema (v3 came later).
+    const mod = freshPlugin();
+    const bus = fakeEventBus();
+    global.window.feedBack = bus;
+    global.window._ddCapabilities = { sectionDifficulty: true };
+    try {
+        mod._smEnsureDifficultySubscription();
+        assert.equal(mod._getState().ddAvailable, true);
+
+        bus.fire('difficulty:sections-updated', { detail: v2Payload({
+            0: { fillPercentage: 40, glassSize: 'small', avgDifficulty: 2, maxDifficulty: 2 },
+            1: { fillPercentage: 100, glassSize: 'large', avgDifficulty: 4, maxDifficulty: 4 },
+        }) });
+
+        const state = mod._getState();
+        assert.equal(state.sectionDifficulty[0].fillPercentage, 40);
+        assert.equal(state.sectionDifficulty[1].glassSize, 'large');
+        // A section the peer reported nothing for is "no glass", not a zero fill.
+        assert.equal(mod._smGetSectionDifficulty(2), null);
+    } finally {
+        delete global.window._ddCapabilities;
+    }
+});
+
+test('peer contract: a current provider payload renders in place without a full re-render', () => {
+    const mod = freshPlugin();
+    const bus = fakeEventBus();
+    global.window.feedBack = bus;
+    // Current builds also advertise sectionsSchema, and emit v2 alongside v3.
+    global.window._ddCapabilities = {
+        sectionDifficulty: true,
+        sectionsSchema: 'difficulty_ladder.sections.v3',
+    };
+    try {
+        mod._smEnsureDifficultySubscription();
+        const bar = new FakeBar();
+        const block = new FakeDifficultyBlock(new FakeGlass('medium', 10));
+        mod._setState({
+            bar,
+            sections: [{ name: 'Intro', time: 0 }],
+            duration: 10,
+            blockEls: [block],
+            sectionDifficulty: {},
+        });
+
+        bus.fire('difficulty:sections-updated', { detail: v2Payload({
+            0: { fillPercentage: 60, glassSize: 'medium' },
+        }) });
+
+        assert.equal(block.insertedHTML.length, 0, 'existing glass updated in place');
+        assert.equal(block._glass._fill.style.height, '60%');
+        assert.equal(block._glass.title, 'Difficulty: 60%');
+    } finally {
+        delete global.window._ddCapabilities;
+    }
+});
+
+test('peer contract: an event with no detail leaves the last good state alone', () => {
+    const mod = freshPlugin();
+    const bus = fakeEventBus();
+    global.window.feedBack = bus;
+    global.window._ddCapabilities = { sectionDifficulty: true };
+    try {
+        mod._smEnsureDifficultySubscription();
+        bus.fire('difficulty:sections-updated', { detail: v2Payload({ 0: { fillPercentage: 25, glassSize: 'small' } }) });
+
+        bus.fire('difficulty:sections-updated', undefined);
+        bus.fire('difficulty:sections-updated', { detail: {} });
+        bus.fire('difficulty:sections-updated', { detail: { sectionDifficulties: 'nope' } });
+
+        assert.equal(mod._getState().sectionDifficulty[0].fillPercentage, 25, 'malformed payloads must not clear good data');
+    } finally {
+        delete global.window._ddCapabilities;
+    }
+});
+
+test('peer contract: an unreadable payload entry paints no glass', () => {
+    // The peer computes fillPercentage arithmetically, so it is NaN whenever
+    // mastery or the phrase difficulty isn't a number -- and NaN is typeof
+    // 'number', which used to sail through the renderer's own check and paint
+    // `height:NaN%`. A payload that isn't the v2 shape at all is dropped the
+    // same way: an entry we can't read renders no glass rather than a
+    // misleading near-empty one.
+    const mod = freshPlugin();
+    const bus = fakeEventBus();
+    global.window.feedBack = bus;
+    global.window._ddCapabilities = { sectionDifficulty: true };
+    try {
+        mod._smEnsureDifficultySubscription();
+        mod._setState({ sectionDifficulty: { 0: { fillPercentage: 25, glassSize: 'small' } } });
+
+        bus.fire('difficulty:sections-updated', { detail: {
+            sectionDifficulties: {
+                0: { fillPercentage: NaN },  // peer arithmetic went NaN
+                1: { fillPercentage: '50' }, // string, not a number
+                2: { fillPercentage: null },
+                3: null,                      // not even an object
+                4: { glassSize: 'small' },    // no fill field at all
+            },
+        } });
+
+        const state = mod._getState();
+        assert.deepEqual(Object.keys(state.sectionDifficulty), []);
+        assert.equal(mod._smGetSectionDifficulty(0), null, 'unreadable entries render no glass');
+        assert.equal(mod._smRenderGlassFilling({ fillPercentage: NaN }), '', 'NaN fill renders nothing at all');
+    } finally {
+        delete global.window._ddCapabilities;
+    }
+});
+
+test('_smRenderGlassFilling only ever writes an allowlisted glassSize into markup', () => {
+    // glassSize is the one payload field that reaches an HTML attribute
+    // unescaped (data-size), so an unrecognized value must resolve to `medium`
+    // rather than being interpolated verbatim.
+    const mod = freshPlugin();
+    for (const size of ['small', 'medium', 'large']) {
+        assert.ok(
+            mod._smRenderGlassFilling({ fillPercentage: 50, glassSize: size }).includes(`data-size="${size}"`),
+            `${size} renders its own bucket`,
+        );
+    }
+    for (const bogus of ['huge', '"><script>alert(1)</script>', undefined, null]) {
+        const html = mod._smRenderGlassFilling({ fillPercentage: 50, glassSize: bogus });
+        assert.ok(html.includes('data-size="medium"'), `${bogus} falls back to medium`);
+        assert.ok(!html.includes('<script'), `${bogus} must not reach markup`);
+    }
+});
+
+test('peer contract: hiding the player detaches the difficulty subscription and re-show re-attaches one', () => {
+    // _smDifficultySubscribed is written from two places (the mount path and the
+    // per-tick retry) and reset on hide; a double-subscribe here would double
+    // every difficulty repaint for the rest of the session.
+    const mod = freshPlugin();
+    const originalSetInterval = global.setInterval;
+    const originalClearInterval = global.clearInterval;
+    const originalHighway = global.highway;
+    const bus = fakeEventBus();
+
+    global.window.feedBack = bus;
+    global.window._ddCapabilities = { sectionDifficulty: true };
+    global.highway = {
+        getSections: () => [],
+        getSongInfo: () => ({ duration: 0 }),
+        getTime: () => 0,
+    };
+    global.setInterval = () => 1;
+    global.clearInterval = () => {};
+
+    try {
+        mod._smSetPlayerVisible(true);
+        assert.equal(bus.count('difficulty:sections-updated'), 1);
+
+        mod._smSetPlayerVisible(false);
+        assert.equal(bus.count('difficulty:sections-updated'), 0, 'hide must detach');
+
+        mod._smSetPlayerVisible(true);
+        assert.equal(bus.count('difficulty:sections-updated'), 1, 're-show re-subscribes exactly once');
+
+        // And a tick must not add a second handler on top.
+        mod._smUpdate();
+        mod._smUpdate();
+        assert.equal(bus.count('difficulty:sections-updated'), 1);
+    } finally {
+        mod._smSetPlayerVisible(false);
+        global.setInterval = originalSetInterval;
+        global.clearInterval = originalClearInterval;
+        delete global.window._ddCapabilities;
+        if (typeof originalHighway === 'undefined') delete global.highway;
+        else global.highway = originalHighway;
+    }
+});
+
+test('peer contract: the per-tick retry never re-registers when the bus hands back no unsubscribe', () => {
+    // The bus is not required to return an unsubscribe handle (a plain
+    // EventTarget's on/off returns undefined). Registering once and keeping the
+    // handler is the only correct outcome -- re-registering every 200ms would
+    // leak a handler per tick.
+    const mod = freshPlugin();
+    const originalHighway = global.highway;
+    let registrations = 0;
+    global.window.feedBack = {
+        on() { registrations++; return undefined; },
+    };
+    global.window._ddCapabilities = { sectionDifficulty: true };
+    global.highway = {
+        getSections: () => [],
+        getSongInfo: () => ({ duration: 0 }),
+        getTime: () => 0,
+    };
+    try {
+        mod._setState({ bar: new FakeBar() });
+        for (let i = 0; i < 5; i++) mod._smUpdate();
+        assert.equal(registrations, 1);
+    } finally {
+        delete global.window._ddCapabilities;
+        if (typeof originalHighway === 'undefined') delete global.highway;
+        else global.highway = originalHighway;
+    }
+});
+
+test('peer contract: the retry waits for the host bus when the peer is already up', () => {
+    // Peer present, host event bus not: nothing to subscribe to yet, so keep
+    // retrying rather than marking the subscription done.
+    const mod = freshPlugin();
+    const originalHighway = global.highway;
+    global.window._ddCapabilities = { sectionDifficulty: true };
+    global.highway = {
+        getSections: () => [],
+        getSongInfo: () => ({ duration: 0 }),
+        getTime: () => 0,
+    };
+    try {
+        mod._setState({ bar: new FakeBar() });
+        mod._smUpdate();
+        assert.equal(mod._getState().difficultySubscribed, false);
+
+        const bus = fakeEventBus();
+        global.window.feedBack = bus;
+        mod._smUpdate();
+        assert.equal(bus.count('difficulty:sections-updated'), 1);
+    } finally {
+        delete global.window._ddCapabilities;
+        if (typeof originalHighway === 'undefined') delete global.highway;
+        else global.highway = originalHighway;
+    }
+});
+
+test('_smNormalizeSectionDifficulties separates an unusable payload from an empty one', () => {
+    const mod = freshPlugin();
+    // null: not an object at all -> "ignore the event", keep current state.
+    assert.equal(mod._smNormalizeSectionDifficulties(undefined), null);
+    assert.equal(mod._smNormalizeSectionDifficulties(null), null);
+    assert.equal(mod._smNormalizeSectionDifficulties(7), null);
+    // {}: a well-formed map with nothing renderable -> "clear the glasses".
+    assert.deepEqual(mod._smNormalizeSectionDifficulties({}), {});
+    assert.deepEqual(mod._smNormalizeSectionDifficulties({ 0: 'nope' }), {});
+    // A 0% fill is real data (a section with no chart content), not a missing one.
+    const zeroFill = mod._smNormalizeSectionDifficulties({ 0: { fillPercentage: 0, glassSize: 'small' } });
+    assert.equal(zeroFill[0].fillPercentage, 0);
+    // Surrounding keys are not the contract: the producer keys by section index,
+    // and only the entries we can render survive.
+    assert.deepEqual(
+        Object.keys(mod._smNormalizeSectionDifficulties({ 0: { fillPercentage: 1 }, schema: 'x' })),
+        ['0'],
+    );
+});
+

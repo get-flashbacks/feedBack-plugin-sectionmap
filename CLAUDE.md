@@ -30,15 +30,70 @@ reading state straight off the Host's `window.highway` object.
   `difficulty_ladder`'s emitted event instead (`_smUpdateDifficultyFills` /
   `_smGetSectionDifficulty` just render whatever `fillPercentage` /
   `glassSize` the event's payload carries per section). This plugin still
-  works standalone with no ladder plugin installed — `_smIsDynamicDifficultyAvailable()`
-  gates the subscription on `window._ddCapabilities`, absent means no
-  glasses are shown, not an error — but when a ladder plugin *is* installed,
-  this is the API, not a coincidence of both sides reading the same Host
-  state. See `difficulty_ladder`'s `INTEGRATION.md` for the full contract
-  (fill formula, fallback/timing behavior). Load order matters: plugins load
-  alphabetically, so `difficulty_ladder` (< `section_map`) sets
-  `window._ddCapabilities` before this plugin's one-time availability check
-  runs.
+  works standalone with no ladder plugin installed — the glasses are its only
+  dependent feature, and `_smIsDynamicDifficultyAvailable()` gates the
+  subscription, so absent means no glasses rather than an error — but when a
+  ladder plugin *is* installed, this is the API, not a coincidence of both
+  sides reading the same Host state. See `difficulty_ladder`'s `INTEGRATION.md`
+  for the full contract (fill formula, fallback/timing behavior). The short
+  version is pinned as a comment block above `_smIsDynamicDifficultyAvailable()`
+  in `screen.js`; keep the two in sync if either changes.
+- **The peer handshake is re-checked, not decided once (issue #13).**
+  `_smEnsureDifficultySubscription()` runs from `_smStartRealtimeHooks()` *and*
+  from every `_smUpdate()` tick, so a Difficulty Ladder that loads or reloads
+  after this plugin is still picked up mid-session. Don't reintroduce a
+  one-shot check, and don't reintroduce the *wrong reason* for removing it
+  either. The accurate version: when both plugins are 'ready' in one
+  `/api/plugins` response, core's `static/js/plugin-loader.js` injects `screen.js`
+  files one at a time in sorted order (`name || id`, ties broken by id), so
+  `difficulty_ladder` does sort ahead of `section_map` and a one-shot check
+  happened to work. That ordering is a property of that one response, not a
+  promise — the loader skips any plugin whose status isn't `'ready'`, refetches
+  on `plugin-registered` startup events, and the backend "clears its plugin
+  registry at the start of `load_plugins()` and repopulates it incrementally
+  while HTTP stays up, so every backend restart serves a window of partial (even
+  empty) responses". A mid-install peer therefore lands on a later refetch, after
+  our script body has run, and our script does not re-run either (the loader's
+  `loadedScripts` guard), so the 200 ms tick is the only retry. The peer emits no
+  readiness event to subscribe to — it just sets its marker at top-level script
+  execution and declares no capability domain. `_smIsDynamicDifficultyAvailable()`
+  requires `window._ddCapabilities.sectionDifficulty === true`, not merely that
+  some `_ddCapabilities` global exists, so a foreign user of that global can't
+  unlock a subscription we can't render. That function must stay
+  reachable-before-bus: it returns early when `feedBack.on` isn't a function yet,
+  and once it has registered a handler `_smDifficultySubscribed` stays true even
+  if the bus returned no unsubscribe handle — otherwise the tick would
+  re-register one handler per 200ms.
+- **The peer compatibility floor is Difficulty Ladder v0.12.0, not v0.2.0.**
+  v0.2.0 is when the *event* first shipped; v0.12.0 is where that plugin's
+  CHANGELOG documents the `difficulty_ladder.sections.v2` payload shape this
+  plugin renders. Issue #13 proposed publishing `v0.9.13` as the floor, but that
+  version was never released — the peer's own README and CHANGELOG call
+  `v0.12.0` the real floor, so that's the number this repo publishes. The floor
+  is documentation, not enforcement, and shouldn't be restated as a check: the
+  marker carries no version and predates v0.2.0, so a below-floor peer passes it
+  and still paints glasses. What actually changed below the floor is the
+  arithmetic behind `fillPercentage` (v0.9.11 aligned it with the peer's own
+  HUD), so an old peer's glasses can *disagree* with Difficulty Ladder's HUD
+  rather than fail to render. Keep the README table and the `screen.js` comment
+  block on the same number.
+- **Payloads are normalized, not trusted (`_smNormalizeSectionDifficulties`).**
+  Entries without a finite numeric `fillPercentage` are dropped, which is what
+  keeps a malformed payload from painting a misleading near-empty glass — and
+  what stops the peer's NaN arithmetic (a NaN `mastery` or phrase difficulty)
+  from reaching the style attribute as `height:NaN%`. A container that isn't an
+  object is ignored entirely so the last good state survives. `null` return
+  means "ignore the event", `{}` means "clear the glasses" — don't collapse those
+  two. `glassSize` is the one payload field that reaches markup unescaped (as
+  `data-size`), so `_smGlassSize()` resolves it against `SM_GLASS_SIZES` before
+  either render path interpolates it.
+- **v3 of the peer contract is deliberately not consumed.**
+  `difficulty:sections-updated-v3` is a render-neutral payload that
+  `difficulty_ladder` emits *alongside* v2. Consuming it means reworking the
+  glass rendering (v3 carries the facts, not the metaphor) — that's this repo's
+  issue #14, and the peer's own transition policy exists so an un-upgraded
+  Section Map keeps working on the frozen v2 event meanwhile. Don't sniff
+  `schema` to "upgrade" this plugin to v3 in passing.
 - **Seeking must go through the Host's canonical funnel**
   (`window.feedBack.seek` / `window.slopsmith.seek`, wrapped by `_smSeek`),
   not by poking `audio.currentTime` directly — see the comment on `_smSeek`

@@ -1,6 +1,7 @@
 // Section Map plugin
 // Shows a minimap bar of the full song structure with clickable sections.
-// Includes optional glass-filling difficulty visualization when dynamic-difficulty is installed.
+// Includes optional glass-filling difficulty visualization when the
+// Difficulty Ladder plugin (difficulty_ladder) is installed.
 
 let _smBar = null;
 let _smSections = [];
@@ -49,40 +50,153 @@ function _smGetColor(name) {
     return SM_COLORS.default;
 }
 
-// Check if the difficulty_ladder plugin (formerly "dynamic-difficulty") is
-// installed and available. `window._ddCapabilities` is the compatibility
-// marker it sets at load time (see difficulty_ladder's screen.js and
-// INTEGRATION.md, issue #63) -- the marker name predates that plugin's
-// rename from `dynamic_difficulty` to `difficulty_ladder`, kept as-is since
-// it's the established capability-marker contract between the two plugins.
-// (A second check here used to also probe `window.feedBackViz_dynamic_difficulty`,
-// a viz-factory-naming-convention global difficulty_ladder never actually
-// set even before the rename -- dead since this function was written.)
-function _smIsDynamicDifficultyAvailable() {
-    if (typeof window.feedBack === 'undefined') return false;
-    if (typeof window._ddCapabilities !== 'undefined') return true;
-    return false;
-}
-
-// Get difficulty data for a section from dynamic-difficulty plugin
-function _smGetSectionDifficulty(sectionIndex) {
-    if (!_smDynamicDifficultyAvailable) return null;
-    // This would be populated by a capability or event from dynamic-difficulty
-    // For now, return from cache if available
-    return _smSectionDifficulty[sectionIndex] || null;
-}
-
-// Initialize difficulty data listener if dynamic-difficulty is available
-function _smInitializeDifficultyListener() {
-    _smDynamicDifficultyAvailable = _smIsDynamicDifficultyAvailable();
-}
-
 function _smSubscribeFeedBackEvent(eventName, handler) {
     if (typeof window.feedBack === 'undefined' || typeof window.feedBack.on !== 'function') return null;
     const unsubscribe = window.feedBack.on(eventName, handler);
     if (typeof unsubscribe === 'function') return unsubscribe;
     if (typeof window.feedBack.off === 'function') return () => window.feedBack.off(eventName, handler);
     return null;
+}
+
+// The Difficulty Ladder peer contract. Section Map is standalone: everything
+// except the per-section "glass fill" indicator works with no peer plugin at
+// all. Only the glasses depend on `difficulty_ladder` (formerly
+// "dynamic-difficulty"), which owns the difficulty:sections-updated event this
+// plugin renders. The full contract lives in that plugin's INTEGRATION.md; the
+// parts this file depends on are:
+//
+//   capability  window._ddCapabilities.sectionDifficulty === true, set at that
+//               plugin's top-level script execution. (`_ddCapabilities` predates
+//               its rename from `dynamic_difficulty` to `difficulty_ladder` and
+//               is kept as-is: it is the established marker between the two
+//               plugins.)
+//   event       'difficulty:sections-updated' (schema difficulty_ladder.sections.v2)
+//   payload     event.detail.sectionDifficulties -- an object map keyed by section
+//               index, each entry { fillPercentage, glassSize, avgDifficulty,
+//               maxDifficulty }. A section with no overlapping phrase is simply
+//               absent from the map, which renders as "no glass".
+//   floor       Difficulty Ladder v0.12.0, the release whose CHANGELOG documents
+//               the v2 payload shape above. The event itself shipped in v0.2.0,
+//               but "Difficulty Ladder is installed" is not a compatibility
+//               statement on its own. Note what the floor is and isn't: the
+//               marker below has existed since well before v0.2.0 and carries no
+//               version, so a below-floor peer still passes it and still paints
+//               glasses. What changed below the floor is the arithmetic behind
+//               fillPercentage (v0.9.11 aligned it with the peer's own HUD), so
+//               an old peer renders a glass that can disagree with Difficulty
+//               Ladder's HUD — not one this plugin can detect. Hence a
+//               documented floor rather than an enforced version check.
+//
+// v3 (`difficulty:sections-updated-v3`, a render-neutral payload) is emitted
+// alongside v2 on a separate event name and is deliberately NOT consumed yet:
+// _smRenderGlassFilling/_smUpdateDifficultyFills render glass metaphors, which is
+// exactly what v3 stops prescribing. That is also why the peer's
+// `sectionsSchema` advertisement is not a gate below — it exists for a consumer
+// choosing between v2 and v3, and the peer keeps emitting v2 unchanged
+// alongside v3 either way.
+const _SM_DD_SECTIONS_EVENT = 'difficulty:sections-updated';
+
+// Check whether the Difficulty Ladder peer is installed AND speaking the
+// contract above. A bare `_ddCapabilities` global is not enough -- require the
+// named marker, so a foreign plugin that happens to use that global (or a stub
+// left behind by an earlier session) leaves the glasses off rather than
+// subscribing to an event whose payload shape we cannot render.
+function _smIsDynamicDifficultyAvailable() {
+    if (typeof window.feedBack === 'undefined') return false;
+    const caps = window._ddCapabilities;
+    return !!caps && typeof caps === 'object' && caps.sectionDifficulty === true;
+}
+
+// Validate one `difficulty_ladder.sections.v2` payload's section map.
+//
+//   null  the container is not an object -- an unusable payload. Callers must
+//         keep whatever they already have rather than repaint from noise.
+//   {}    a well-formed container with nothing renderable in it, which clears
+//         the glasses (the "no glass, not a stale one" convention).
+//
+// Entries are dropped unless they carry a finite numeric `fillPercentage`. The
+// peer computes it arithmetically, so it is NaN whenever mastery or the phrase
+// difficulty isn't a number — and a NaN sails through the `typeof === 'number'`
+// check the renderer used to do, painting `height:NaN%` and a "Difficulty: NaN%"
+// title. The same check drops anything from a payload that isn't the v2 shape at
+// all, so an entry we can't read renders no glass instead of a misleading
+// near-empty one.
+function _smNormalizeSectionDifficulties(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const normalized = {};
+    for (const key of Object.keys(raw)) {
+        const entry = raw[key];
+        if (!entry || typeof entry !== 'object') continue;
+        if (!Number.isFinite(entry.fillPercentage)) continue;
+        normalized[key] = entry;
+    }
+    return normalized;
+}
+
+// Get difficulty data for a section from the Difficulty Ladder peer
+function _smGetSectionDifficulty(sectionIndex) {
+    if (!_smDynamicDifficultyAvailable) return null;
+    // Populated by difficulty_ladder's difficulty:sections-updated event.
+    return _smSectionDifficulty[sectionIndex] || null;
+}
+
+// Initialize difficulty data listener if the Difficulty Ladder peer is available
+function _smInitializeDifficultyListener() {
+    _smDynamicDifficultyAvailable = _smIsDynamicDifficultyAvailable();
+}
+
+// difficulty:sections-updated handler.
+function _smOnSectionsUpdated(event) {
+    const normalized = _smNormalizeSectionDifficulties(event && event.detail && event.detail.sectionDifficulties);
+    if (normalized === null) return;
+    _smSectionDifficulty = normalized;
+    // Difficulty refreshes change only the per-section glass fill, not
+    // colors/labels/positions — update those in place rather than paying for a
+    // full _smRender() (which tears down and rebuilds every block's DOM) on
+    // every event, which can fire repeatedly over the course of a song. Falls
+    // back to a full render if the cached blocks don't match the current
+    // section list (bar not built for these sections yet).
+    if (_smBar && _smSections.length > 0 && _smBlockEls.length === _smSections.length) {
+        _smUpdateDifficultyFills();
+    } else {
+        _smRender();
+    }
+}
+
+// Subscribe to the peer's section-difficulty event if it is available yet.
+//
+// This re-runs rather than deciding once per mount on purpose. When both
+// plugins come back 'ready' in one /api/plugins response, core injects screen.js
+// files one at a time in sorted order (`name || id`, ties broken by id), so
+// difficulty_ladder sorts ahead of section_map and the old one-shot check
+// happened to work. That ordering is a property of that one response, not a
+// guarantee: static/js/plugin-loader.js skips any plugin whose status isn't
+// 'ready', and the backend "clears its plugin registry at the start of
+// load_plugins() and repopulates it incrementally while HTTP stays up, so every
+// backend restart serves a window of partial (even empty) responses". A peer
+// that is mid-install then arrives on a later refetch (the loader refetches on
+// `plugin-registered` startup events) — after our script body has already run,
+// and our script does not run again either, so nothing else would ever retry.
+// The peer emits no readiness event to subscribe to either; it just sets its
+// marker at top-level script execution. So _smUpdate() calls this on every
+// 200ms tick while the player is visible: one property read per tick,
+// short-circuiting on a single boolean once registered.
+//
+// One-directional on purpose: a peer that vanishes mid-song leaves its last
+// glasses in place rather than tearing down mid-render, and the contract is
+// that an absent peer means no glasses, never an error.
+function _smEnsureDifficultySubscription() {
+    if (_smDifficultySubscribed) return;
+    _smInitializeDifficultyListener();
+    if (!_smDynamicDifficultyAvailable) return;
+    const bus = window.feedBack;
+    if (!bus || typeof bus.on !== 'function') return; // host bus not up yet -- retry next tick
+    // From here a handler IS registered, so _smDifficultySubscribed means
+    // "registered", not "removable": the bus isn't required to return an
+    // unsubscribe handle, and re-registering every 200ms because it didn't
+    // would leak a handler per tick.
+    _smDifficultySubscribed = true;
+    _smDifficultyUnsubscribe = _smSubscribeFeedBackEvent(_SM_DD_SECTIONS_EVENT, _smOnSectionsUpdated);
 }
 
 function _smStartRealtimeHooks() {
@@ -98,28 +212,7 @@ function _smStartRealtimeHooks() {
         _smSongReadySubscribed = typeof _smSongReadyUnsubscribe === 'function';
     }
 
-    _smInitializeDifficultyListener();
-    if (_smDynamicDifficultyAvailable && !_smDifficultySubscribed) {
-        _smDifficultyUnsubscribe = _smSubscribeFeedBackEvent('difficulty:sections-updated', (event) => {
-            const { sectionDifficulties } = event.detail || {};
-            if (sectionDifficulties) {
-                _smSectionDifficulty = sectionDifficulties;
-                // Difficulty refreshes change only the per-section glass fill,
-                // not colors/labels/positions — update those in place rather
-                // than paying for a full _smRender() (which tears down and
-                // rebuilds every block's DOM) on every event, which can fire
-                // repeatedly over the course of a song. Falls back to a full
-                // render if the cached blocks don't match the current
-                // section list (bar not built for these sections yet).
-                if (_smBar && _smSections.length > 0 && _smBlockEls.length === _smSections.length) {
-                    _smUpdateDifficultyFills();
-                } else {
-                    _smRender();
-                }
-            }
-        });
-        _smDifficultySubscribed = typeof _smDifficultyUnsubscribe === 'function';
-    }
+    _smEnsureDifficultySubscription();
 }
 
 function _smStopRealtimeHooks() {
@@ -136,9 +229,11 @@ function _smStopRealtimeHooks() {
 
     if (typeof _smDifficultyUnsubscribe === 'function') {
         _smDifficultyUnsubscribe();
+        _smDifficultyUnsubscribe = null;
+        _smDifficultySubscribed = false;
     }
-    _smDifficultyUnsubscribe = null;
-    _smDifficultySubscribed = false;
+    // If there's no disposer, keep _smDifficultySubscribed true to prevent
+    // accumulating handlers on hide/show cycles (bus returned no unsubscribe handle).
 }
 
 function _smSetPlayerVisible(isVisible) {
@@ -244,6 +339,11 @@ function _smOnWheel(e) {
 }
 
 function _smUpdate() {
+    // Retry the Difficulty Ladder handshake before anything else: the peer may
+    // have loaded (or reloaded) after this plugin did, and glasses are the one
+    // thing that can't wait for the next song. No-op once subscribed.
+    _smEnsureDifficultySubscription();
+
     if (!_smBar) return;
     const sections = highway.getSections();
     const info = highway.getSongInfo();
@@ -373,21 +473,34 @@ function _smRender() {
     _smActiveIdx = -1;
 }
 
+// Size buckets for the glass, keyed by the difficulty_ladder.sections.v2
+// `glassSize` value. Module-level because two call sites need it: the renderer
+// below and _smUpdateDifficultyFills()'s size-change comparison.
+const SM_GLASS_SIZES = {
+    small: 'width:12px;height:12px;',
+    medium: 'width:16px;height:16px;',
+    large: 'width:20px;height:20px;',
+};
+
+// The one place a peer's `glassSize` enters our markup: it lands unescaped in
+// the `data-size` attribute, so resolve it against the allowlist first rather
+// than trusting the string. Anything unrecognized (including markup) becomes
+// `medium`, matching the style fallback.
+function _smGlassSize(difficulty) {
+    const size = difficulty && difficulty.glassSize;
+    return Object.prototype.hasOwnProperty.call(SM_GLASS_SIZES, size) ? size : 'medium';
+}
+
 // Render glass-filling visualization for section difficulty
 function _smRenderGlassFilling(difficulty) {
-    if (!difficulty || typeof difficulty.fillPercentage !== 'number') return '';
+    // isFinite, not typeof: the peer derives this arithmetically and a NaN
+    // mastery or phrase difficulty yields NaN, which is typeof 'number' and
+    // would otherwise reach the style attribute as `height:NaN%`.
+    if (!difficulty || !Number.isFinite(difficulty.fillPercentage)) return '';
 
     const fillPct = Math.max(0, Math.min(100, difficulty.fillPercentage));
-    const glassSize = difficulty.glassSize || 'medium'; // small, medium, large
-
-    // Size classes for the glass
-    const sizeStyles = {
-        small: 'width:12px;height:12px;',
-        medium: 'width:16px;height:16px;',
-        large: 'width:20px;height:20px;',
-    };
-
-    const glassStyle = sizeStyles[glassSize] || sizeStyles.medium;
+    const glassSize = _smGlassSize(difficulty);
+    const glassStyle = SM_GLASS_SIZES[glassSize];
 
     // Classed (and size-tagged) so _smUpdateDifficultyFills() can update an
     // existing glass's fill height/title in place on a difficulty refresh,
@@ -402,10 +515,10 @@ function _smRenderGlassFilling(difficulty) {
 // Refresh only the per-section difficulty "glass fill" indicators in place
 // (fill height + title) instead of rebuilding the whole section-map bar.
 // Called from the 'difficulty:sections-updated' event, which can fire
-// repeatedly while a song plays as dynamic-difficulty tracks accuracy — none
-// of that data changes section colors/labels/positions, so a full _smRender()
-// on every event would tear down and rebuild every block's DOM just to
-// repaint a handful of small fill bars.
+// repeatedly while a song plays as difficulty_ladder re-derives each section's
+// difficulty — none of that data changes section colors/labels/positions, so a
+// full _smRender() on every event would tear down and rebuild every block's DOM
+// just to repaint a handful of small fill bars.
 function _smUpdateDifficultyFills() {
     if (!_smBar || !_smBlockEls.length) return;
     for (let i = 0; i < _smBlockEls.length; i++) {
@@ -413,9 +526,9 @@ function _smUpdateDifficultyFills() {
         if (!block || typeof block.querySelector !== 'function') continue;
         const difficulty = _smGetSectionDifficulty(i);
         const glass = block.querySelector('.sm-glass');
-        if (_smDynamicDifficultyAvailable && difficulty && typeof difficulty.fillPercentage === 'number') {
+        if (_smDynamicDifficultyAvailable && difficulty && Number.isFinite(difficulty.fillPercentage)) {
             const fillPct = Math.max(0, Math.min(100, difficulty.fillPercentage));
-            const glassSize = difficulty.glassSize || 'medium';
+            const glassSize = _smGlassSize(difficulty);
             const sizeChanged = glass && glass.getAttribute && glass.getAttribute('data-size') !== glassSize;
             if (glass && !sizeChanged) {
                 // Same glass already present (the common case while a song
@@ -456,10 +569,12 @@ if (typeof module !== 'undefined' && module.exports) {
         _smOnClick, _smOnWheel, _smEscapeHtml,
         _smIsDynamicDifficultyAvailable, _smGetSectionDifficulty, _smRenderGlassFilling,
         _smUpdateDifficultyFills,
+        _smNormalizeSectionDifficulties, _smOnSectionsUpdated, _smEnsureDifficultySubscription,
         _smInitializeDifficultyListener, _smStartRealtimeHooks, _smStopRealtimeHooks, _smSetPlayerVisible,
         _getState: () => ({
             bar: _smBar, sections: _smSections, duration: _smDuration, sectionDifficulty: _smSectionDifficulty,
             ddAvailable: _smDynamicDifficultyAvailable, markerEl: _smMarkerEl, blockEls: _smBlockEls, activeIdx: _smActiveIdx,
+            songReadySubscribed: _smSongReadySubscribed, difficultySubscribed: _smDifficultySubscribed,
         }),
         _setState(next) {
             if ('sections' in next) _smSections = next.sections;
