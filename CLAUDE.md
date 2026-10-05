@@ -42,20 +42,28 @@ reading state straight off the Host's `window.highway` object.
   `_smEnsureDifficultySubscription()` runs from `_smStartRealtimeHooks()` *and*
   from every `_smUpdate()` tick, so a Difficulty Ladder that loads or reloads
   after this plugin is still picked up mid-session. Don't reintroduce a
-  one-shot check: the old one leaned on alphabetical plugin loading
-  (`difficulty_ladder` < `section_map`), which core does not actually promise —
-  `feedBack/static/js/session.js` is explicit that "plugins load ASYNCHRONOUSLY,
-  so the chain links up in whatever order the race settles". There is no
-  readiness event to subscribe to either — the peer sets its marker at top-level
-  script execution and declares no capability domain — so the 200 ms tick is the
-  retry. `_smIsDynamicDifficultyAvailable()` requires
-  `window._ddCapabilities.sectionDifficulty === true`, not merely that some
-  `_ddCapabilities` global exists, so a foreign user of that global can't unlock
-  a subscription we can't render. That function must stay reachable-before-bus:
-  it returns early when `feedBack.on` isn't a function yet, and once it has
-  registered a handler `_smDifficultySubscribed` stays true even if the bus
-  returned no unsubscribe handle — otherwise the tick would re-register one
-  handler per 200ms.
+  one-shot check, and don't reintroduce the *wrong reason* for removing it
+  either. The accurate version: when both plugins are 'ready' in one
+  `/api/plugins` response, core's `static/js/plugin-loader.js` injects `screen.js`
+  files one at a time in sorted order (`name || id`, ties broken by id), so
+  `difficulty_ladder` does sort ahead of `section_map` and a one-shot check
+  happened to work. That ordering is a property of that one response, not a
+  promise — the loader skips any plugin whose status isn't `'ready'`, refetches
+  on `plugin-registered` startup events, and the backend "clears its plugin
+  registry at the start of `load_plugins()` and repopulates it incrementally
+  while HTTP stays up, so every backend restart serves a window of partial (even
+  empty) responses". A mid-install peer therefore lands on a later refetch, after
+  our script body has run, and our script does not re-run either (the loader's
+  `loadedScripts` guard), so the 200 ms tick is the only retry. The peer emits no
+  readiness event to subscribe to — it just sets its marker at top-level script
+  execution and declares no capability domain. `_smIsDynamicDifficultyAvailable()`
+  requires `window._ddCapabilities.sectionDifficulty === true`, not merely that
+  some `_ddCapabilities` global exists, so a foreign user of that global can't
+  unlock a subscription we can't render. That function must stay
+  reachable-before-bus: it returns early when `feedBack.on` isn't a function yet,
+  and once it has registered a handler `_smDifficultySubscribed` stays true even
+  if the bus returned no unsubscribe handle — otherwise the tick would
+  re-register one handler per 200ms.
 - **The peer compatibility floor is Difficulty Ladder v0.12.0, not v0.2.0.**
   v0.2.0 is when the *event* first shipped; v0.12.0 is where that plugin's
   CHANGELOG documents the `difficulty_ladder.sections.v2` payload shape this

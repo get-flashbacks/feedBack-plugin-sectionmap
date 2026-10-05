@@ -165,13 +165,22 @@ function _smOnSectionsUpdated(event) {
 
 // Subscribe to the peer's section-difficulty event if it is available yet.
 //
-// This re-runs rather than deciding once per mount on purpose. The peer sets
-// its marker at top-level script execution and emits no readiness event, and
-// the Host does not order plugin loads — core's session.js is explicit that
-// "plugins load ASYNCHRONOUSLY, so [a wrapper chain] links up in whatever order
-// the race settles". _smUpdate() calls this on every 200ms tick while the player
-// is visible: one property read per tick, short-circuiting on a single boolean
-// once registered.
+// This re-runs rather than deciding once per mount on purpose. When both
+// plugins come back 'ready' in one /api/plugins response, core injects screen.js
+// files one at a time in sorted order (`name || id`, ties broken by id), so
+// difficulty_ladder sorts ahead of section_map and the old one-shot check
+// happened to work. That ordering is a property of that one response, not a
+// guarantee: static/js/plugin-loader.js skips any plugin whose status isn't
+// 'ready', and the backend "clears its plugin registry at the start of
+// load_plugins() and repopulates it incrementally while HTTP stays up, so every
+// backend restart serves a window of partial (even empty) responses". A peer
+// that is mid-install then arrives on a later refetch (the loader refetches on
+// `plugin-registered` startup events) — after our script body has already run,
+// and our script does not run again either, so nothing else would ever retry.
+// The peer emits no readiness event to subscribe to either; it just sets its
+// marker at top-level script execution. So _smUpdate() calls this on every
+// 200ms tick while the player is visible: one property read per tick,
+// short-circuiting on a single boolean once registered.
 //
 // One-directional on purpose: a peer that vanishes mid-song leaves its last
 // glasses in place rather than tearing down mid-render, and the contract is
