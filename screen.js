@@ -229,9 +229,11 @@ function _smStopRealtimeHooks() {
 
     if (typeof _smDifficultyUnsubscribe === 'function') {
         _smDifficultyUnsubscribe();
+        _smDifficultyUnsubscribe = null;
+        _smDifficultySubscribed = false;
     }
-    _smDifficultyUnsubscribe = null;
-    _smDifficultySubscribed = false;
+    // If there's no disposer, keep _smDifficultySubscribed true to prevent
+    // accumulating handlers on hide/show cycles (bus returned no unsubscribe handle).
 }
 
 function _smSetPlayerVisible(isVisible) {
