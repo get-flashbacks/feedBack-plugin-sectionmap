@@ -1,10 +1,20 @@
 {
   "id": "section_map",
   "name": "Section Map",
-  "version": "1.2.7",
+  "version": "1.3.0",
   "private": false,
   "script": "screen.js",
   "category": "practice",
-  "description": "Visual song-section map and navigation.",
-  "icon": "assets/thumb.svg"
+  "description": "Visual song-section map and navigation. Optional: Difficulty Ladder v0.12.0+ adds per-section difficulty glasses.",
+  "icon": "assets/thumb.svg",
+  "capabilities": {
+    "difficulty-ladder": {
+      "roles": ["observer"],
+      "observes": ["difficulty:sections-updated"],
+      "compatibility": "degrade-noop",
+      "safety": "safe",
+      "version": 1,
+      "description": "Optional peer plugin, used for the difficulty glasses only; section navigation, layout and seeking are standalone. Renders the peer's difficulty_ladder.sections.v2 sectionDifficulties payload (payload floor: Difficulty Ladder v0.12.0) behind window._ddCapabilities.sectionDifficulty. No peer, a peer that doesn't advertise the marker, or a payload entry we can't read all mean no glasses rather than an error."
+    }
+  }
 }
