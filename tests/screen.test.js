@@ -589,17 +589,16 @@ function fakeEventBus() {
         calls: [],
         on(eventName, handler) {
             this.calls.push(eventName);
-            if (!handlers.has(eventName)) handlers.set(eventName, []);
-            handlers.get(eventName).push(handler);
+            // Replace the list rather than mutating it: fire() iterates the live
+            // list, and a handler is free to (un)subscribe while it runs.
+            handlers.set(eventName, (handlers.get(eventName) || []).concat(handler));
             return () => {
-                const list = handlers.get(eventName) || [];
-                const i = list.indexOf(handler);
-                if (i >= 0) list.splice(i, 1);
+                handlers.set(eventName, (handlers.get(eventName) || []).filter((h) => h !== handler));
             };
         },
         count(eventName) { return (handlers.get(eventName) || []).length; },
         fire(eventName, event) {
-            for (const handler of [...(handlers.get(eventName) || [])]) handler(event);
+            for (const handler of handlers.get(eventName) || []) handler(event);
         },
     };
 }
