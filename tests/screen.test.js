@@ -589,8 +589,9 @@ function fakeEventBus() {
         calls: [],
         on(eventName, handler) {
             this.calls.push(eventName);
-            // Replace the list rather than mutating it: fire() iterates the live
-            // list, and a handler is free to (un)subscribe while it runs.
+            // Replace the list rather than mutating it: fire() captures the list
+            // when it starts, so a handler that subscribes or unsubscribes
+            // mid-dispatch can't disturb the dispatch already in progress.
             handlers.set(eventName, (handlers.get(eventName) || []).concat(handler));
             return () => {
                 handlers.set(eventName, (handlers.get(eventName) || []).filter((h) => h !== handler));
