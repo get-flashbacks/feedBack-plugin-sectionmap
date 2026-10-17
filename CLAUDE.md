@@ -1,7 +1,7 @@
 # Section Map — AI Agent Guide
 
 Draws a minimap bar of the current song's structure over the player, with
-click/wheel seeking and a per-section "glass fill" difficulty indicator.
+click/wheel seeking and a per-section difficulty "tier rail" indicator.
 Frontend-only — there's no `routes.py`; all logic lives in `screen.js`,
 reading state straight off the Host's `window.highway` object.
 
@@ -23,21 +23,39 @@ reading state straight off the Host's `window.highway` object.
   feedBack#923/#924. Patching `window.showScreen` here would silently never
   fire for real navigation; this was an actual regression until fixed.
 - **Section-difficulty data comes from `difficulty_ladder`'s
-  `difficulty:sections-updated` event, not independent `highway` reads
-  (issue #63).** This plugin used to independently read `highway.getPhrases()`
-  / `hasPhraseData()` / `getMastery()` for section-difficulty data — that
-  changed when the glass-fill rendering was rewritten to consume
-  `difficulty_ladder`'s emitted event instead (`_smUpdateDifficultyFills` /
-  `_smGetSectionDifficulty` just render whatever `fillPercentage` /
-  `glassSize` the event's payload carries per section). This plugin still
-  works standalone with no ladder plugin installed — the glasses are its only
-  dependent feature, and `_smIsDynamicDifficultyAvailable()` gates the
-  subscription, so absent means no glasses rather than an error — but when a
+  `difficulty:sections-updated` / `difficulty:sections-updated-v3` events, not
+  independent `highway` reads (issue #63).** This plugin used to independently
+  read `highway.getPhrases()` / `hasPhraseData()` / `getMastery()` for
+  section-difficulty data — that changed when the rendering was rewritten to
+  consume `difficulty_ladder`'s emitted events instead. Issue #14 then replaced
+  the old glass-fill rendering (which consumed the v2 `fillPercentage` /
+  `glassSize` fields) with a semantic tier rail: `_smOnSectionsUpdatedV3` /
+  `_smNormalizeSectionTiers` / `_smGetSectionTier` carry each section's
+  `current_tier` / `top_tier` / `max_tier` / `has_chart_content`, and
+  `_smTierModel` / `_smRenderTierRail` / `_smUpdateTierRails` render it. This
+  plugin still works standalone with no ladder plugin installed — the rails are
+  its only dependent feature, and `_smIsDynamicDifficultyAvailable()` gates the
+  subscription, so absent means no rails rather than an error — but when a
   ladder plugin *is* installed, this is the API, not a coincidence of both
   sides reading the same Host state. See `difficulty_ladder`'s `INTEGRATION.md`
-  for the full contract (fill formula, fallback/timing behavior). The short
+  for the full contract (tier semantics, fallback/timing behavior). The short
   version is pinned as a comment block above `_smIsDynamicDifficultyAvailable()`
   in `screen.js`; keep the two in sync if either changes.
+- **v3 is preferred; v2 is a bounded-transition fallback.** When
+  `_smPeerSpeaksV3()` sees `window._ddCapabilities.sectionsSchema ===
+  'difficulty_ladder.sections.v3'`, the subscription is to
+  `difficulty:sections-updated-v3` and `_smNormalizeSectionTiers` reads its
+  `sections` array directly. A peer that predates v3 (marker present, no
+  `sectionsSchema`) still gets `difficulty:sections-updated`, and
+  `_smNormalizeSectionTiersV2` reconstructs a coarse rail from `fillPercentage`
+  (`topTier = maxTier = maxDifficulty`, `currentTier = round(fill × topTier)`)
+  while discarding `glassSize` entirely. v3 is feature-detected, never
+  version-pinned — the marker carries no version. This is not the "don't sniff
+  `schema`" rule: we key off the capability marker the peer publishes, not the
+  payload's own `schema` field (which we deliberately ignore). The v2 fallback
+  is kept only while the peer's transition policy keeps emitting it; when that
+  policy drops v2, delete `_smNormalizeSectionTiersV2` / `_smOnSectionsUpdated`
+  and the v2 branch of `_smEnsureDifficultySubscription`.
 - **The peer handshake is re-checked, not decided once (issue #13).**
   `_smEnsureDifficultySubscription()` runs from `_smStartRealtimeHooks()` *and*
   from every `_smUpdate()` tick, so a Difficulty Ladder that loads or reloads
@@ -72,28 +90,43 @@ reading state straight off the Host's `window.highway` object.
   `v0.12.0` the real floor, so that's the number this repo publishes. The floor
   is documentation, not enforcement, and shouldn't be restated as a check: the
   marker carries no version and predates v0.2.0, so a below-floor peer passes it
-  and still paints glasses. What actually changed below the floor is the
+  and still paints rails. What actually changed below the floor is the
   arithmetic behind `fillPercentage` (v0.9.11 aligned it with the peer's own
-  HUD), so an old peer's glasses can *disagree* with Difficulty Ladder's HUD
-  rather than fail to render. Keep the README table and the `screen.js` comment
-  block on the same number.
-- **Payloads are normalized, not trusted (`_smNormalizeSectionDifficulties`).**
-  Entries without a finite numeric `fillPercentage` are dropped, which is what
-  keeps a malformed payload from painting a misleading near-empty glass — and
-  what stops the peer's NaN arithmetic (a NaN `mastery` or phrase difficulty)
-  from reaching the style attribute as `height:NaN%`. A container that isn't an
-  object is ignored entirely so the last good state survives. `null` return
-  means "ignore the event", `{}` means "clear the glasses" — don't collapse those
-  two. `glassSize` is the one payload field that reaches markup unescaped (as
-  `data-size`), so `_smGlassSize()` resolves it against `SM_GLASS_SIZES` before
-  either render path interpolates it.
-- **v3 of the peer contract is deliberately not consumed.**
-  `difficulty:sections-updated-v3` is a render-neutral payload that
-  `difficulty_ladder` emits *alongside* v2. Consuming it means reworking the
-  glass rendering (v3 carries the facts, not the metaphor) — that's this repo's
-  issue #14, and the peer's own transition policy exists so an un-upgraded
-  Section Map keeps working on the frozen v2 event meanwhile. Don't sniff
-  `schema` to "upgrade" this plugin to v3 in passing.
+  HUD), so an old peer's rails can *disagree* with Difficulty Ladder's HUD
+  rather than fail to render. The v3 payload supersedes this arithmetic
+  entirely, which is why it is preferred. Keep the README table and the
+  `screen.js` comment block on the same number.
+- **Payloads are normalized, not trusted (`_smNormalizeSectionTiers` /
+  `_smNormalizeSectionTiersV2`).** v3 entries without finite numeric `index`,
+  `max_tier` and `top_tier` are dropped, which keeps the peer's NaN arithmetic
+  from reaching the style attribute. v2 entries without a finite numeric
+  `fillPercentage` are dropped the same way. A container that isn't an object,
+  or a v3 payload whose `sections` isn't an array, is ignored entirely so the
+  last good state survives. `null` return means "ignore the event", `{}` means
+  "clear the rails" — don't collapse those two. `current_tier` is allowed to be
+  `null` (the peer's "no usable mastery" case): it renders an unlit rail, not a
+  zero tier. In v2 `glassSize` is discarded, and in v3 the payload's own `schema`
+  field is ignored (we key off the capability marker, not the payload).
+- **The rail encodes difficulty semantically, never by size.** `_smTierModel`
+  produces `{ maxTier, topTier, currentTier, full }`: `top_tier` 0 with
+  `has_chart_content` is the easy-but-playable "full at every position" case
+  (`full: true`), `top_tier` 0 without content is silent (`null`, no rail), and
+  `current_tier` is clamped to `top_tier`. `_smRenderTierRail` draws
+  `maxTier + 1` fixed-size segments, lights the first `currentTier + 1`, and
+  outlines the `topTier` segment; `_smShouldCollapse` falls back to a single
+  marker on a block too narrow for the segments (a non-positive measured width
+  means "not laid out yet", where segments are kept). Colors are the literals
+  the peer's own guide uses (`SM_TIER_LIT` `#e8c040`, `SM_TIER_UNLIT`
+  `rgba(200,200,200,0.25)`, `SM_TIER_TOP` `#f4d35e`) — deliberately shared by
+  meaning, not Host CSS variables. The readable detail `Section name · tier X of
+  Y · full detail at Z` (`_smTierSuffix`) is the same wording in the block's
+  `title` and its `aria-label`; only tier-bearing blocks get a `tabindex`.
+  `_smUpdateTierRails` repaints in place, and a per-section signature
+  (`_smTierSignatures`) skips the rails whose data didn't change — no full
+  `_smRender()` per peer event. Because the signature tracks tier data, not
+  width, a `resize` listener (inside the hooks guard) calls `_smHandleResize`,
+  which clears the signatures and repaints so the width-dependent
+  segments-vs-marker choice is re-decided.
 - **Seeking must go through the Host's canonical funnel**
   (`window.feedBack.seek` / `window.slopsmith.seek`, wrapped by `_smSeek`),
   not by poking `audio.currentTime` directly — see the comment on `_smSeek`
