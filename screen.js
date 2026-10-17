@@ -656,6 +656,37 @@ function _smRender() {
 // section colors/labels/positions, so a full _smRender() on every event would
 // tear down and rebuild every block's DOM just to repaint a few small rails.
 // A per-section signature skips the rails whose tier data did not change.
+function _smUpdateBlockRail(block, model, blockPx) {
+    if (!block || typeof block.querySelector !== 'function') return;
+    const rail = block.querySelector('.sm-rail');
+    if (model) {
+        if (rail) rail.innerHTML = _smRailInner(model, blockPx);
+        else block.insertAdjacentHTML('afterbegin', _smRenderTierRail(model, blockPx));
+    } else if (rail) {
+        rail.remove();
+    }
+}
+
+function _smUpdateBlockAttributes(block, sec, model) {
+    if (!block || typeof block.querySelector !== 'function') return;
+    const { titleLabel } = _smSectionLabel(sec);
+    const tierSuffix = _smTierSuffix(model);
+    const baseTitle = `${titleLabel} (${_smFmt(sec.time)})`;
+    block.title = tierSuffix ? `${baseTitle} · ${tierSuffix}` : baseTitle;
+    // Mirror _smRender's attributes exactly, in both directions: a block
+    // that gains tier data becomes a focus stop, and one that loses it
+    // stops being one (otherwise tabindex lingers on a bare, unnamed div).
+    if (typeof block.setAttribute === 'function' && typeof block.removeAttribute === 'function') {
+        if (model) {
+            block.setAttribute('aria-label', `${titleLabel} · ${tierSuffix}`);
+            block.setAttribute('tabindex', '0');
+        } else {
+            block.removeAttribute('aria-label');
+            block.removeAttribute('tabindex');
+        }
+    }
+}
+
 function _smUpdateTierRails() {
     if (!_smBar || !_smBlockEls.length) return;
     const barWidth = _smBar.getBoundingClientRect ? _smBar.getBoundingClientRect().width : 0;
@@ -666,37 +697,15 @@ function _smUpdateTierRails() {
         _smTierSignatures[i] = signature;
 
         const block = _smBlockEls[i];
-        if (!block || typeof block.querySelector !== 'function') continue;
+        if (!block) continue;
 
         const sec = _smSections[i];
         const nextTime = i < _smSections.length - 1 ? _smSections[i + 1].time : _smDuration;
         const widthPct = _smDuration > 0 ? ((nextTime - sec.time) / _smDuration) * 100 : 0;
         const blockPx = barWidth > 0 ? (widthPct / 100) * barWidth : 0;
 
-        const rail = block.querySelector('.sm-rail');
-        if (model) {
-            if (rail) rail.innerHTML = _smRailInner(model, blockPx);
-            else block.insertAdjacentHTML('afterbegin', _smRenderTierRail(model, blockPx));
-        } else if (rail) {
-            rail.remove();
-        }
-
-        const { titleLabel } = _smSectionLabel(sec);
-        const tierSuffix = _smTierSuffix(model);
-        const baseTitle = `${titleLabel} (${_smFmt(sec.time)})`;
-        block.title = tierSuffix ? `${baseTitle} · ${tierSuffix}` : baseTitle;
-        // Mirror _smRender's attributes exactly, in both directions: a block
-        // that gains tier data becomes a focus stop, and one that loses it
-        // stops being one (otherwise tabindex lingers on a bare, unnamed div).
-        if (typeof block.setAttribute === 'function' && typeof block.removeAttribute === 'function') {
-            if (model) {
-                block.setAttribute('aria-label', `${titleLabel} · ${tierSuffix}`);
-                block.setAttribute('tabindex', '0');
-            } else {
-                block.removeAttribute('aria-label');
-                block.removeAttribute('tabindex');
-            }
-        }
+        _smUpdateBlockRail(block, model, blockPx);
+        _smUpdateBlockAttributes(block, sec, model);
     }
 }
 
