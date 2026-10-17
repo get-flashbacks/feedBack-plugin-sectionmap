@@ -1,6 +1,7 @@
 'use strict';
 // Coverage for pure/DOM-light helpers in screen.js: section color lookup,
-// time formatting, render HTML shape, click/wheel seek math.
+// time formatting, render HTML shape, click/wheel seek math, and the
+// Difficulty Ladder tier-rail contract (v3 preferred, v2 during transition).
 // Runs under the org reusable CI as `node tests/screen.test.js`.
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -438,148 +439,259 @@ test('_smUpdate clears the bar even when song:ready already zeroed _smSections f
     }
 });
 
-// _smUpdateDifficultyFills updates an existing glass in place (no DOM
-// rebuild) on a difficulty refresh, only rebuilding the one glass element
-// when its size bucket changes, per its own doc comment.
+// Tier semantics (issue #14): the rail is driven by v3's semantic fields
+// (current_tier / top_tier / max_tier / has_chart_content), never by a size.
 
-class FakeGlassFill {
-    constructor() { this.style = {}; }
-}
+test('_smTierModel reads current/top/max tiers and treats top_tier 0 with content as full detail', () => {
+    const mod = freshPlugin();
+    assert.equal(mod._smTierModel(null), null);
 
-class FakeGlass {
-    constructor(size, fillPct) {
-        this._size = size;
-        this.title = `Difficulty: ${fillPct}%`;
-        this.removed = false;
-        this._fill = new FakeGlassFill();
-        this._fill.style.height = fillPct + '%';
-    }
-    getAttribute(name) { return name === 'data-size' ? this._size : null; }
-    querySelector(sel) { return sel === '.sm-glass-fill' ? this._fill : null; }
+    const normal = mod._smTierModel({ max_tier: 4, top_tier: 3, current_tier: 2, has_chart_content: true });
+    assert.deepEqual(normal, { maxTier: 4, topTier: 3, currentTier: 2, full: false });
+
+    // current_tier is clamped to top_tier: above that tier the entry is already
+    // played in full, so there is no larger tier to report.
+    const over = mod._smTierModel({ max_tier: 4, top_tier: 2, current_tier: 4, has_chart_content: true });
+    assert.equal(over.currentTier, 2);
+    assert.equal(over.full, true);
+
+    // top_tier 0 with content: easy but playable, full at every position.
+    const easy = mod._smTierModel({ max_tier: 0, top_tier: 0, current_tier: 0, has_chart_content: true });
+    assert.deepEqual(easy, { maxTier: 0, topTier: 0, currentTier: 0, full: true });
+
+    // top_tier 0 without content: silent, not "easy" -- no rail at all.
+    assert.equal(mod._smTierModel({ max_tier: 0, top_tier: 0, current_tier: null, has_chart_content: false }), null);
+
+    // A null current_tier keeps the rail (with the outline) but lights nothing.
+    const unknown = mod._smTierModel({ max_tier: 3, top_tier: 3, current_tier: null, has_chart_content: true });
+    assert.equal(unknown.currentTier, null);
+    assert.equal(unknown.full, false);
+});
+
+test('_smTierSuffix renders the shared readable detail, omitting the full-detail clause with no ladder', () => {
+    const mod = freshPlugin();
+    assert.equal(mod._smTierSuffix(null), '');
+    assert.equal(
+        mod._smTierSuffix({ maxTier: 4, topTier: 3, currentTier: 2, full: false }),
+        'tier 2 of 4 · full detail at 3',
+    );
+    assert.equal(
+        mod._smTierSuffix({ maxTier: 0, topTier: 0, currentTier: 0, full: true }),
+        'tier 0 of 0',
+    );
+    assert.equal(
+        mod._smTierSuffix({ maxTier: 3, topTier: 3, currentTier: null, full: false }),
+        'tier unknown · full detail at 3',
+    );
+});
+
+test('_smRenderTierRail lights current+1 segments and outlines the full-detail threshold', () => {
+    const mod = freshPlugin();
+    const html = mod._smRenderTierRail({ maxTier: 3, topTier: 3, currentTier: 1, full: false }, 500);
+    assert.equal((html.match(/class="sm-rail-seg"/g) || []).length, 4, 'maxTier + 1 segments');
+    assert.equal((html.match(/#e8c040/g) || []).length, 2, 'tiers 0 and 1 are lit');
+    assert.equal((html.match(/rgba\(200,200,200,0\.25\)/g) || []).length, 2, 'tiers 2 and 3 are unlit');
+    assert.equal((html.match(/#f4d35e/g) || []).length, 1, 'exactly one outline marks topTier');
+    assert.ok(!html.includes('sm-rail-marker'), 'a wide block draws segments, not a marker');
+
+    // The easy-but-playable case (maxTier 0) is a single segment, still
+    // outlined — the same semantic the collapsed form draws.
+    const easy = mod._smRenderTierRail({ maxTier: 0, topTier: 0, currentTier: 0, full: true }, 500);
+    assert.equal((easy.match(/class="sm-rail-seg/g) || []).length, 1);
+    assert.equal((easy.match(/#e8c040/g) || []).length, 1, 'the single segment is lit');
+    assert.equal((easy.match(/#f4d35e/g) || []).length, 1, 'and outlined');
+});
+
+test('_smRenderTierRail collapses to a single marker when the block cannot fit segments', () => {
+    const mod = freshPlugin();
+    // maxTier 3 -> 4 segments * 5px + 3 gaps = 23px needed; 10px cannot fit.
+    const narrow = mod._smRenderTierRail({ maxTier: 3, topTier: 3, currentTier: 1, full: false }, 10);
+    assert.equal((narrow.match(/sm-rail-marker/g) || []).length, 1);
+    assert.equal((narrow.match(/class="sm-rail-seg/g) || []).length, 1, 'only the marker is drawn');
+
+    // An unmeasurable width (bar not laid out) keeps the segments.
+    const unmeasured = mod._smRenderTierRail({ maxTier: 3, topTier: 3, currentTier: 1, full: false }, 0);
+    assert.ok(!unmeasured.includes('sm-rail-marker'));
+    assert.equal((unmeasured.match(/class="sm-rail-seg"/g) || []).length, 4);
+});
+
+test('_smRender attaches a rail plus a focusable, readable detail to a section with tier data', () => {
+    const mod = freshPlugin();
+    const bar = new FakeBar();
+    mod._setState({
+        bar,
+        sections: [{ name: 'verse2', time: 0 }, { name: 'Chorus', time: 1 }],
+        duration: 100,
+        ddAvailable: true,
+        sectionTiers: {
+            0: { index: 0, max_tier: 4, top_tier: 3, current_tier: 2, has_chart_content: true },
+            1: { index: 1, max_tier: 2, top_tier: 2, current_tier: 2, has_chart_content: true },
+        },
+    });
+    mod._smRender();
+    assert.ok(bar.innerHTML.includes('class="sm-rail"'), 'rail container rendered');
+    assert.ok(bar.innerHTML.includes('tabindex="0"'), 'tier-bearing block is focusable');
+    assert.ok(
+        bar.innerHTML.includes('aria-label="Verse 2 · tier 2 of 4 · full detail at 3"'),
+        'accessible name carries the shared detail',
+    );
+    assert.ok(
+        bar.innerHTML.includes('title="Verse 2 (0:00) · tier 2 of 4 · full detail at 3"'),
+        'hover title carries the same detail',
+    );
+});
+
+test('_smRender collapses a very narrow section to a single marker without dropping its label', () => {
+    const mod = freshPlugin();
+    const bar = new FakeBar();
+    bar.width = 500;
+    // Intro is 1% of a 500px bar = 5px -> a 4-segment rail cannot fit.
+    mod._setState({
+        bar,
+        sections: [{ name: 'Intro', time: 0 }, { name: 'Verse 1', time: 1 }],
+        duration: 100,
+        ddAvailable: true,
+        sectionTiers: {
+            0: { index: 0, max_tier: 3, top_tier: 3, current_tier: 1, has_chart_content: true },
+            1: { index: 1, max_tier: 3, top_tier: 3, current_tier: 1, has_chart_content: true },
+        },
+    });
+    mod._smRender();
+    assert.equal((bar.innerHTML.match(/sm-rail-marker/g) || []).length, 1, 'narrow Intro collapses');
+    assert.ok(bar.innerHTML.includes('>Intro<'), 'label survives the collapse');
+});
+
+test('_smRender leaves a section without tier data without a rail or tab stop', () => {
+    const mod = freshPlugin();
+    const bar = new FakeBar();
+    mod._setState({
+        bar,
+        sections: [{ name: 'Intro', time: 0 }],
+        duration: 10,
+        ddAvailable: true,
+        sectionTiers: {}, // no overlapping phrase -> absent entry
+    });
+    mod._smRender();
+    assert.ok(!bar.innerHTML.includes('class="sm-rail"'));
+    assert.ok(!bar.innerHTML.includes('tabindex'));
+});
+
+// _smUpdateTierRails updates an existing rail in place (no DOM rebuild) on a
+// difficulty refresh, and only for the sections whose tier data changed.
+
+class FakeRail {
+    constructor(html) { this._innerHTML = html || ''; this.writes = 0; this.removed = false; }
+    get innerHTML() { return this._innerHTML; }
+    set innerHTML(v) { this._innerHTML = v; this.writes++; }
     remove() { this.removed = true; }
 }
 
-class FakeDifficultyBlock {
-    constructor(glass) {
-        this._glass = glass || null;
-        this.insertedHTML = [];
-    }
-    querySelector(sel) { return sel === '.sm-glass' ? this._glass : null; }
+class FakeRailBlock {
+    constructor(rail) { this._rail = rail || null; this.title = ''; this._attrs = {}; this.inserted = []; }
+    querySelector(sel) { return sel === '.sm-rail' ? this._rail : null; }
     insertAdjacentHTML(_pos, html) {
-        this.insertedHTML.push(html);
-        const sizeMatch = html.match(/data-size="(\w+)"/);
-        const fillMatch = html.match(/height:([\d.]+)%/);
-        const titleMatch = html.match(/title="([^"]*)"/);
-        const glass = new FakeGlass(sizeMatch ? sizeMatch[1] : 'medium', fillMatch ? fillMatch[1] : '0');
-        if (titleMatch) glass.title = titleMatch[1];
-        this._glass = glass;
+        this.inserted.push(html);
+        const inner = html.replace(/^<div[^>]*>/, '').replace(/<\/div>$/, '');
+        this._rail = new FakeRail(inner);
     }
+    setAttribute(name, value) { this._attrs[name] = value; }
+    removeAttribute(name) { delete this._attrs[name]; }
 }
 
-test('_smUpdateDifficultyFills updates an existing glass fill/title in place without rebuilding it', () => {
+test('_smUpdateTierRails rebuilds only the rails whose tier data changed', () => {
     const mod = freshPlugin();
-    const glass = new FakeGlass('medium', 10);
-    const block = new FakeDifficultyBlock(glass);
+    const sections = [{ name: 'Intro', time: 0 }, { name: 'Verse 1', time: 50 }];
+    const block0 = new FakeRailBlock(new FakeRail('old'));
+    const block1 = new FakeRailBlock(new FakeRail('old'));
+    const bar = new FakeBar();
     mod._setState({
-        bar: new FakeBar(),
-        blockEls: [block],
-        sectionDifficulty: [{ fillPercentage: 40, glassSize: 'medium' }],
+        bar,
+        sections,
+        duration: 100,
+        blockEls: [block0, block1],
         ddAvailable: true,
+        tierSignatures: ['3|3|1|0', '3|3|1|0'],
+        sectionTiers: {
+            0: { index: 0, max_tier: 3, top_tier: 3, current_tier: 1, has_chart_content: true },
+            1: { index: 1, max_tier: 3, top_tier: 3, current_tier: 1, has_chart_content: true },
+        },
     });
 
-    mod._smUpdateDifficultyFills();
+    mod._smUpdateTierRails();
+    assert.equal(block0._rail.writes, 0, 'unchanged section is not repainted');
+    assert.equal(block1._rail.writes, 0);
 
-    assert.equal(block._glass, glass, 'same glass element reused, not rebuilt');
-    assert.equal(glass.removed, false);
-    assert.equal(block.insertedHTML.length, 0);
-    assert.equal(glass._fill.style.height, '40%');
-    assert.equal(glass.title, 'Difficulty: 40%');
+    // Only section 0's tier advances.
+    mod._setState({ sectionTiers: {
+        0: { index: 0, max_tier: 3, top_tier: 3, current_tier: 2, has_chart_content: true },
+        1: { index: 1, max_tier: 3, top_tier: 3, current_tier: 1, has_chart_content: true },
+    } });
+    mod._smUpdateTierRails();
+    assert.equal(block0._rail.writes, 1, 'changed section repaints in place');
+    assert.equal(block1._rail.writes, 0, 'unrelated section is left alone');
+    assert.ok(block0._rail.innerHTML.includes('sm-rail-seg'));
+    assert.equal(block0._attrs['aria-label'], 'Intro · tier 2 of 3 · full detail at 3');
 });
 
-test('_smUpdateDifficultyFills rebuilds the glass when its size bucket changes', () => {
+test('_smUpdateTierRails creates a rail when tier data appears and removes it when it goes away', () => {
     const mod = freshPlugin();
-    const glass = new FakeGlass('small', 10);
-    const block = new FakeDifficultyBlock(glass);
+    const sections = [{ name: 'Intro', time: 0 }];
+    const block = new FakeRailBlock(null);
     mod._setState({
         bar: new FakeBar(),
+        sections,
+        duration: 10,
         blockEls: [block],
-        sectionDifficulty: [{ fillPercentage: 75, glassSize: 'large' }],
         ddAvailable: true,
+        sectionTiers: {},
     });
 
-    mod._smUpdateDifficultyFills();
+    mod._smUpdateTierRails();
+    assert.equal(block.inserted.length, 0, 'no rail while there is no data');
+    assert.equal(block._attrs.tabindex, undefined, 'no focus stop without tier data');
 
-    assert.equal(glass.removed, true, 'old size-mismatched glass is discarded');
-    assert.equal(block.insertedHTML.length, 1);
-    assert.notEqual(block._glass, glass, 'a fresh glass element replaces it');
-    assert.equal(block._glass.title, 'Difficulty: 75%');
+    mod._setState({ sectionTiers: { 0: { index: 0, max_tier: 2, top_tier: 2, current_tier: 1, has_chart_content: true } } });
+    mod._smUpdateTierRails();
+    assert.equal(block.inserted.length, 1, 'rail inserted when data arrives');
+    assert.ok(block.inserted[0].includes('class="sm-rail"'));
+    assert.equal(block._attrs.tabindex, '0', 'block becomes a focus stop when data arrives');
+    assert.equal(block._attrs['aria-label'], 'Intro · tier 1 of 2 · full detail at 2');
+
+    mod._setState({ sectionTiers: {}, tierSignatures: ['2|2|1|0'] });
+    mod._smUpdateTierRails();
+    assert.equal(block._rail.removed, true, 'stale rail removed when data disappears');
+    assert.equal(block._attrs.tabindex, undefined, 'phantom focus stop must not linger');
+    assert.equal(block._attrs['aria-label'], undefined);
 });
 
-test('_smUpdateDifficultyFills removes a stale glass once difficulty data is no longer available', () => {
+test('_smHandleResize re-decides the width-dependent rail form', () => {
     const mod = freshPlugin();
-    const glass = new FakeGlass('medium', 10);
-    const block = new FakeDifficultyBlock(glass);
+    const bar = new FakeBar();
+    const block = new FakeRailBlock(new FakeRail('stale'));
     mod._setState({
-        bar: new FakeBar(),
+        bar,
+        sections: [{ name: 'Intro', time: 0 }],
+        duration: 100,
         blockEls: [block],
-        sectionDifficulty: [],
+        sectionTiers: { 0: { index: 0, max_tier: 3, top_tier: 3, current_tier: 1, has_chart_content: true } },
         ddAvailable: true,
+        tierSignatures: ['3|3|1|0'],
     });
 
-    mod._smUpdateDifficultyFills();
+    bar.width = 10; // 100% of 10px -> a 4-segment rail cannot fit
+    mod._smHandleResize();
+    assert.ok(block._rail.innerHTML.includes('sm-rail-marker'), 'collapses on a narrow bar');
 
-    assert.equal(glass.removed, true);
+    bar.width = 500; // now it fits
+    mod._smHandleResize();
+    assert.ok(!block._rail.innerHTML.includes('sm-rail-marker'), 'expands back to segments');
+    assert.ok(block._rail.innerHTML.includes('sm-rail-seg'));
 });
 
-test('_smSetPlayerVisible retries event subscription after feedBack becomes available', () => {
-    const mod = freshPlugin();
-    const originalSetInterval = global.setInterval;
-    const originalClearInterval = global.clearInterval;
-    const originalHighway = global.highway;
-    const originalFeedBack = global.window.feedBack;
-    let intervalId = 0;
-    let onCalls = 0;
-    let unsubscribeCalls = 0;
-
-    global.highway = {
-        getSections: () => [],
-        getSongInfo: () => ({ duration: 0 }),
-        getTime: () => 0,
-    };
-    delete global.window.feedBack;
-    global.setInterval = () => ++intervalId;
-    global.clearInterval = () => {};
-
-    try {
-        mod._smSetPlayerVisible(true);
-        global.window.feedBack = {
-            on: () => {
-                onCalls++;
-                return () => { unsubscribeCalls++; };
-            },
-        };
-
-        mod._smSetPlayerVisible(true);
-        assert.equal(onCalls, 1);
-
-        mod._smSetPlayerVisible(false);
-        assert.equal(unsubscribeCalls, 1);
-    } finally {
-        mod._smSetPlayerVisible(false);
-        global.setInterval = originalSetInterval;
-        global.clearInterval = originalClearInterval;
-        if (typeof originalHighway === 'undefined') delete global.highway;
-        else global.highway = originalHighway;
-        if (typeof originalFeedBack === 'undefined') delete global.window.feedBack;
-        else global.window.feedBack = originalFeedBack;
-    }
-});
-
-
-// Difficulty Ladder peer contract (issue #13): absent, late-loaded, minimum, and
-// current providers, plus malformed and older payloads. The glasses are the only
-// feature that depends on the peer, so every one of these has to leave base
-// section navigation working.
+// Difficulty Ladder peer contract (issue #14): absent, late-loaded, v3 and
+// legacy-v2 providers, plus malformed payloads. The rail is the only feature
+// that depends on the peer, so every one of these has to leave base section
+// navigation working.
 
 // Minimal stand-in for a host event bus: records (event, handler) so a test can
 // fire the peer's event exactly as the host would, and count subscriptions.
@@ -604,9 +716,36 @@ function fakeEventBus() {
     };
 }
 
-// A difficulty_ladder.sections.v2 payload, as difficulty_ladder emits it: an
-// object map keyed by section index, one entry per section that has an
-// overlapping phrase (sections with none are simply absent).
+// A difficulty_ladder.sections.v3 section entry, as difficulty_ladder emits it.
+function v3Section(index, overrides) {
+    return Object.assign({
+        id: 'section:' + index,
+        index,
+        start_time: index * 10,
+        end_time: index * 10 + 10,
+        is_current: false,
+        current_tier: 1,
+        top_tier: 3,
+        max_tier: 3,
+        avg_top_tier: 3,
+        has_chart_content: true,
+        phrases: [],
+    }, overrides || {});
+}
+
+function v3Payload(sections, overrides) {
+    return Object.assign({
+        schema: 'difficulty_ladder.sections.v3',
+        player_context: null,
+        mastery: 0.5,
+        max_tier: 4,
+        current_phrase_index: 0,
+        sections,
+    }, overrides || {});
+}
+
+// A legacy difficulty_ladder.sections.v2 payload: an object map keyed by
+// section index, one entry per section with an overlapping phrase.
 function v2Payload(entries) {
     return {
         schema: 'difficulty_ladder.sections.v2',
@@ -616,7 +755,7 @@ function v2Payload(entries) {
     };
 }
 
-test('peer contract: no provider means no subscription and no glasses', () => {
+test('peer contract: no provider means no subscription and no rails', () => {
     const mod = freshPlugin();
     const bus = fakeEventBus();
     global.window.feedBack = bus;
@@ -627,8 +766,8 @@ test('peer contract: no provider means no subscription and no glasses', () => {
 
     assert.equal(mod._getState().ddAvailable, false);
     assert.deepEqual(bus.calls, [], 'must not subscribe without the capability marker');
-    mod._setState({ sectionDifficulty: { 0: { fillPercentage: 50 } } });
-    assert.equal(mod._smGetSectionDifficulty(0), null, 'cached data stays unreachable while the peer is absent');
+    mod._setState({ sectionTiers: { 0: { max_tier: 3, top_tier: 3, current_tier: 1, has_chart_content: true } } });
+    assert.equal(mod._smGetSectionTier(0), null, 'cached data stays unreachable while the peer is absent');
 });
 
 test('peer contract: a bare _ddCapabilities global is not a provider', () => {
@@ -636,7 +775,7 @@ test('peer contract: a bare _ddCapabilities global is not a provider', () => {
     const bus = fakeEventBus();
     global.window.feedBack = bus;
     // Some other plugin using the same global name, or a ladder build from
-    // before the v2 contract existed. Either way, no sectionDifficulty marker.
+    // before the sectionDifficulty contract existed. Either way, no marker.
     global.window._ddCapabilities = { somethingElse: true };
     try {
         assert.equal(mod._smIsDynamicDifficultyAvailable(), false);
@@ -647,11 +786,83 @@ test('peer contract: a bare _ddCapabilities global is not a provider', () => {
     }
 });
 
+test('peer contract: a v3-capable provider subscribes to the render-neutral event', () => {
+    const mod = freshPlugin();
+    const bus = fakeEventBus();
+    global.window.feedBack = bus;
+    global.window._ddCapabilities = {
+        sectionDifficulty: true,
+        sectionsSchema: 'difficulty_ladder.sections.v3',
+    };
+    try {
+        assert.equal(mod._smPeerSpeaksV3(), true);
+        mod._smEnsureDifficultySubscription();
+        assert.equal(bus.count('difficulty:sections-updated-v3'), 1);
+        assert.equal(bus.count('difficulty:sections-updated'), 0, 'v2 is not also subscribed');
+    } finally {
+        delete global.window._ddCapabilities;
+    }
+});
+
+test('peer contract: a v3 payload populates tier state per section', () => {
+    const mod = freshPlugin();
+    const bus = fakeEventBus();
+    global.window.feedBack = bus;
+    global.window._ddCapabilities = {
+        sectionDifficulty: true,
+        sectionsSchema: 'difficulty_ladder.sections.v3',
+    };
+    try {
+        mod._smEnsureDifficultySubscription();
+        assert.equal(mod._getState().ddAvailable, true);
+
+        bus.fire('difficulty:sections-updated-v3', { detail: v3Payload([
+            v3Section(0, { current_tier: 2, top_tier: 3, max_tier: 3 }),
+            v3Section(1, { current_tier: 3, top_tier: 3, max_tier: 3 }),
+        ]) });
+
+        assert.equal(mod._smGetSectionTier(0).current_tier, 2);
+        assert.equal(mod._smGetSectionTier(1).current_tier, 3);
+        // A section the peer reported nothing for is "no rail", not a zero tier.
+        assert.equal(mod._smGetSectionTier(2), null);
+    } finally {
+        delete global.window._ddCapabilities;
+    }
+});
+
+test('peer contract: a v3 payload updates rails in place without a full re-render', () => {
+    const mod = freshPlugin();
+    const bus = fakeEventBus();
+    global.window.feedBack = bus;
+    global.window._ddCapabilities = {
+        sectionDifficulty: true,
+        sectionsSchema: 'difficulty_ladder.sections.v3',
+    };
+    try {
+        mod._smEnsureDifficultySubscription();
+        const block = new FakeRailBlock(new FakeRail('old'));
+        mod._setState({
+            bar: new FakeBar(),
+            sections: [{ name: 'Intro', time: 0 }],
+            duration: 10,
+            blockEls: [block],
+            sectionTiers: {},
+        });
+
+        bus.fire('difficulty:sections-updated-v3', { detail: v3Payload([
+            v3Section(0, { current_tier: 2 }),
+        ]) });
+
+        assert.equal(block.inserted.length, 0, 'existing rail updated in place');
+        assert.ok(block._rail.innerHTML.includes('#e8c040'));
+    } finally {
+        delete global.window._ddCapabilities;
+    }
+});
+
 test('peer contract: a late-loading provider is picked up by the next _smUpdate tick', () => {
-    // The original handshake decided once, at player-screen mount, which relied
-    // on the Host loading plugins alphabetically (difficulty_ladder <
-    // section_map). A deferred or reloaded plugin load left the feature
-    // unsubscribed for the rest of the session; the retry is the poller.
+    // The handshake re-runs every tick, so a peer that loads (or reloads) after
+    // this plugin does is still picked up mid-session.
     const mod = freshPlugin();
     const originalHighway = global.highway;
     const bus = fakeEventBus();
@@ -664,15 +875,18 @@ test('peer contract: a late-loading provider is picked up by the next _smUpdate 
     try {
         mod._setState({ bar: new FakeBar() });
         mod._smUpdate(); // player already visible, peer not loaded yet
-        assert.equal(bus.count('difficulty:sections-updated'), 0);
+        assert.equal(bus.count('difficulty:sections-updated-v3'), 0);
 
-        global.window._ddCapabilities = { sectionDifficulty: true };
+        global.window._ddCapabilities = {
+            sectionDifficulty: true,
+            sectionsSchema: 'difficulty_ladder.sections.v3',
+        };
         mod._smUpdate();
-        assert.equal(bus.count('difficulty:sections-updated'), 1, 'subscribed on the next tick');
+        assert.equal(bus.count('difficulty:sections-updated-v3'), 1, 'subscribed on the next tick');
 
         mod._smUpdate();
         mod._smUpdate();
-        assert.equal(bus.count('difficulty:sections-updated'), 1, 'subscribed exactly once');
+        assert.equal(bus.count('difficulty:sections-updated-v3'), 1, 'subscribed exactly once');
     } finally {
         delete global.window._ddCapabilities;
         if (typeof originalHighway === 'undefined') delete global.highway;
@@ -680,60 +894,29 @@ test('peer contract: a late-loading provider is picked up by the next _smUpdate 
     }
 });
 
-test('peer contract: a minimum (v0.12.0) provider payload renders glasses', () => {
-    // v0.12.0 is the floor: the first release documenting the v2 payload shape.
-    // It advertises sectionDifficulty and no sectionsSchema (v3 came later).
+test('peer contract: a legacy v2-only provider is still supported during the transition', () => {
+    // No sectionsSchema -> the peer predates v3. Keep consuming its frozen v2
+    // event and reconstruct a coarse rail from fillPercentage, ignoring
+    // glassSize entirely.
     const mod = freshPlugin();
     const bus = fakeEventBus();
     global.window.feedBack = bus;
     global.window._ddCapabilities = { sectionDifficulty: true };
     try {
         mod._smEnsureDifficultySubscription();
-        assert.equal(mod._getState().ddAvailable, true);
+        assert.equal(bus.count('difficulty:sections-updated'), 1);
+        assert.equal(bus.count('difficulty:sections-updated-v3'), 0);
 
         bus.fire('difficulty:sections-updated', { detail: v2Payload({
-            0: { fillPercentage: 40, glassSize: 'small', avgDifficulty: 2, maxDifficulty: 2 },
-            1: { fillPercentage: 100, glassSize: 'large', avgDifficulty: 4, maxDifficulty: 4 },
+            0: { fillPercentage: 50, glassSize: 'large', avgDifficulty: 2, maxDifficulty: 4 },
         }) });
 
-        const state = mod._getState();
-        assert.equal(state.sectionDifficulty[0].fillPercentage, 40);
-        assert.equal(state.sectionDifficulty[1].glassSize, 'large');
-        // A section the peer reported nothing for is "no glass", not a zero fill.
-        assert.equal(mod._smGetSectionDifficulty(2), null);
-    } finally {
-        delete global.window._ddCapabilities;
-    }
-});
-
-test('peer contract: a current provider payload renders in place without a full re-render', () => {
-    const mod = freshPlugin();
-    const bus = fakeEventBus();
-    global.window.feedBack = bus;
-    // Current builds also advertise sectionsSchema, and emit v2 alongside v3.
-    global.window._ddCapabilities = {
-        sectionDifficulty: true,
-        sectionsSchema: 'difficulty_ladder.sections.v3',
-    };
-    try {
-        mod._smEnsureDifficultySubscription();
-        const bar = new FakeBar();
-        const block = new FakeDifficultyBlock(new FakeGlass('medium', 10));
-        mod._setState({
-            bar,
-            sections: [{ name: 'Intro', time: 0 }],
-            duration: 10,
-            blockEls: [block],
-            sectionDifficulty: {},
-        });
-
-        bus.fire('difficulty:sections-updated', { detail: v2Payload({
-            0: { fillPercentage: 60, glassSize: 'medium' },
-        }) });
-
-        assert.equal(block.insertedHTML.length, 0, 'existing glass updated in place');
-        assert.equal(block._glass._fill.style.height, '60%');
-        assert.equal(block._glass.title, 'Difficulty: 60%');
+        const entry = mod._smGetSectionTier(0);
+        assert.equal(entry.max_tier, 4);
+        assert.equal(entry.top_tier, 4);
+        assert.equal(entry.current_tier, 2, 'fill 50% of a 4-tier ladder lights 2');
+        assert.equal(entry.has_chart_content, true);
+        assert.equal('glassSize' in entry, false, 'glassSize is discarded, not carried through');
     } finally {
         delete global.window._ddCapabilities;
     }
@@ -743,77 +926,58 @@ test('peer contract: an event with no detail leaves the last good state alone', 
     const mod = freshPlugin();
     const bus = fakeEventBus();
     global.window.feedBack = bus;
-    global.window._ddCapabilities = { sectionDifficulty: true };
+    global.window._ddCapabilities = {
+        sectionDifficulty: true,
+        sectionsSchema: 'difficulty_ladder.sections.v3',
+    };
     try {
         mod._smEnsureDifficultySubscription();
-        bus.fire('difficulty:sections-updated', { detail: v2Payload({ 0: { fillPercentage: 25, glassSize: 'small' } }) });
+        bus.fire('difficulty:sections-updated-v3', { detail: v3Payload([v3Section(0, { current_tier: 1 })]) });
 
-        bus.fire('difficulty:sections-updated', undefined);
-        bus.fire('difficulty:sections-updated', { detail: {} });
-        bus.fire('difficulty:sections-updated', { detail: { sectionDifficulties: 'nope' } });
+        bus.fire('difficulty:sections-updated-v3', undefined);
+        bus.fire('difficulty:sections-updated-v3', { detail: {} });
+        bus.fire('difficulty:sections-updated-v3', { detail: { sections: 'nope' } });
 
-        assert.equal(mod._getState().sectionDifficulty[0].fillPercentage, 25, 'malformed payloads must not clear good data');
+        assert.equal(mod._smGetSectionTier(0).current_tier, 1, 'malformed payloads must not clear good data');
     } finally {
         delete global.window._ddCapabilities;
     }
 });
 
-test('peer contract: an unreadable payload entry paints no glass', () => {
-    // The peer computes fillPercentage arithmetically, so it is NaN whenever
-    // mastery or the phrase difficulty isn't a number -- and NaN is typeof
-    // 'number', which used to sail through the renderer's own check and paint
-    // `height:NaN%`. A payload that isn't the v2 shape at all is dropped the
-    // same way: an entry we can't read renders no glass rather than a
-    // misleading near-empty one.
+test('peer contract: an unreadable v3 entry paints no rail', () => {
+    // The peer derives tiers arithmetically, so current_tier can be null and
+    // max/top tiers can go NaN. An entry we can't read is dropped; a payload
+    // whose sections array is unusable is ignored, keeping the last good state.
     const mod = freshPlugin();
     const bus = fakeEventBus();
     global.window.feedBack = bus;
-    global.window._ddCapabilities = { sectionDifficulty: true };
+    global.window._ddCapabilities = {
+        sectionDifficulty: true,
+        sectionsSchema: 'difficulty_ladder.sections.v3',
+    };
     try {
         mod._smEnsureDifficultySubscription();
-        mod._setState({ sectionDifficulty: { 0: { fillPercentage: 25, glassSize: 'small' } } });
+        mod._setState({ sectionTiers: { 0: { max_tier: 3, top_tier: 3, current_tier: 1, has_chart_content: true } } });
 
-        bus.fire('difficulty:sections-updated', { detail: {
-            sectionDifficulties: {
-                0: { fillPercentage: NaN },  // peer arithmetic went NaN
-                1: { fillPercentage: '50' }, // string, not a number
-                2: { fillPercentage: null },
-                3: null,                      // not even an object
-                4: { glassSize: 'small' },    // no fill field at all
-            },
-        } });
+        bus.fire('difficulty:sections-updated-v3', { detail: v3Payload([
+            v3Section(1, { max_tier: NaN }),        // peer arithmetic went NaN
+            v3Section(2, { top_tier: '3' }),        // string, not a number
+            { index: 3 },                            // no tier fields at all
+            null,                                    // not even an object
+        ]) });
 
         const state = mod._getState();
-        assert.deepEqual(Object.keys(state.sectionDifficulty), []);
-        assert.equal(mod._smGetSectionDifficulty(0), null, 'unreadable entries render no glass');
-        assert.equal(mod._smRenderGlassFilling({ fillPercentage: NaN }), '', 'NaN fill renders nothing at all');
+        assert.deepEqual(Object.keys(state.sectionTiers), []);
+        assert.equal(mod._smGetSectionTier(1), null, 'unreadable entries render no rail');
     } finally {
         delete global.window._ddCapabilities;
-    }
-});
-
-test('_smRenderGlassFilling only ever writes an allowlisted glassSize into markup', () => {
-    // glassSize is the one payload field that reaches an HTML attribute
-    // unescaped (data-size), so an unrecognized value must resolve to `medium`
-    // rather than being interpolated verbatim.
-    const mod = freshPlugin();
-    for (const size of ['small', 'medium', 'large']) {
-        assert.ok(
-            mod._smRenderGlassFilling({ fillPercentage: 50, glassSize: size }).includes(`data-size="${size}"`),
-            `${size} renders its own bucket`,
-        );
-    }
-    for (const bogus of ['huge', '"><script>alert(1)</script>', undefined, null]) {
-        const html = mod._smRenderGlassFilling({ fillPercentage: 50, glassSize: bogus });
-        assert.ok(html.includes('data-size="medium"'), `${bogus} falls back to medium`);
-        assert.ok(!html.includes('<script'), `${bogus} must not reach markup`);
     }
 });
 
 test('peer contract: hiding the player detaches the difficulty subscription and re-show re-attaches one', () => {
     // _smDifficultySubscribed is written from two places (the mount path and the
     // per-tick retry) and reset on hide; a double-subscribe here would double
-    // every difficulty repaint for the rest of the session.
+    // every rail repaint for the rest of the session.
     const mod = freshPlugin();
     const originalSetInterval = global.setInterval;
     const originalClearInterval = global.clearInterval;
@@ -821,7 +985,10 @@ test('peer contract: hiding the player detaches the difficulty subscription and 
     const bus = fakeEventBus();
 
     global.window.feedBack = bus;
-    global.window._ddCapabilities = { sectionDifficulty: true };
+    global.window._ddCapabilities = {
+        sectionDifficulty: true,
+        sectionsSchema: 'difficulty_ladder.sections.v3',
+    };
     global.highway = {
         getSections: () => [],
         getSongInfo: () => ({ duration: 0 }),
@@ -832,18 +999,18 @@ test('peer contract: hiding the player detaches the difficulty subscription and 
 
     try {
         mod._smSetPlayerVisible(true);
-        assert.equal(bus.count('difficulty:sections-updated'), 1);
+        assert.equal(bus.count('difficulty:sections-updated-v3'), 1);
 
         mod._smSetPlayerVisible(false);
-        assert.equal(bus.count('difficulty:sections-updated'), 0, 'hide must detach');
+        assert.equal(bus.count('difficulty:sections-updated-v3'), 0, 'hide must detach');
 
         mod._smSetPlayerVisible(true);
-        assert.equal(bus.count('difficulty:sections-updated'), 1, 're-show re-subscribes exactly once');
+        assert.equal(bus.count('difficulty:sections-updated-v3'), 1, 're-show re-subscribes exactly once');
 
         // And a tick must not add a second handler on top.
         mod._smUpdate();
         mod._smUpdate();
-        assert.equal(bus.count('difficulty:sections-updated'), 1);
+        assert.equal(bus.count('difficulty:sections-updated-v3'), 1);
     } finally {
         mod._smSetPlayerVisible(false);
         global.setInterval = originalSetInterval;
@@ -865,7 +1032,10 @@ test('peer contract: the per-tick retry never re-registers when the bus hands ba
     global.window.feedBack = {
         on() { registrations++; return undefined; },
     };
-    global.window._ddCapabilities = { sectionDifficulty: true };
+    global.window._ddCapabilities = {
+        sectionDifficulty: true,
+        sectionsSchema: 'difficulty_ladder.sections.v3',
+    };
     global.highway = {
         getSections: () => [],
         getSongInfo: () => ({ duration: 0 }),
@@ -887,7 +1057,10 @@ test('peer contract: the retry waits for the host bus when the peer is already u
     // retrying rather than marking the subscription done.
     const mod = freshPlugin();
     const originalHighway = global.highway;
-    global.window._ddCapabilities = { sectionDifficulty: true };
+    global.window._ddCapabilities = {
+        sectionDifficulty: true,
+        sectionsSchema: 'difficulty_ladder.sections.v3',
+    };
     global.highway = {
         getSections: () => [],
         getSongInfo: () => ({ duration: 0 }),
@@ -901,7 +1074,7 @@ test('peer contract: the retry waits for the host bus when the peer is already u
         const bus = fakeEventBus();
         global.window.feedBack = bus;
         mod._smUpdate();
-        assert.equal(bus.count('difficulty:sections-updated'), 1);
+        assert.equal(bus.count('difficulty:sections-updated-v3'), 1);
     } finally {
         delete global.window._ddCapabilities;
         if (typeof originalHighway === 'undefined') delete global.highway;
@@ -909,23 +1082,73 @@ test('peer contract: the retry waits for the host bus when the peer is already u
     }
 });
 
-test('_smNormalizeSectionDifficulties separates an unusable payload from an empty one', () => {
+test('_smSetPlayerVisible retries the song:ready subscription after feedBack becomes available', () => {
+    // The host bus may not exist when the player first mounts; _smSongReadySubscribed
+    // stays false so the next _smSetPlayerVisible(true) retries it.
     const mod = freshPlugin();
-    // null: not an object at all -> "ignore the event", keep current state.
-    assert.equal(mod._smNormalizeSectionDifficulties(undefined), null);
-    assert.equal(mod._smNormalizeSectionDifficulties(null), null);
-    assert.equal(mod._smNormalizeSectionDifficulties(7), null);
-    // {}: a well-formed map with nothing renderable -> "clear the glasses".
-    assert.deepEqual(mod._smNormalizeSectionDifficulties({}), {});
-    assert.deepEqual(mod._smNormalizeSectionDifficulties({ 0: 'nope' }), {});
-    // A 0% fill is real data (a section with no chart content), not a missing one.
-    const zeroFill = mod._smNormalizeSectionDifficulties({ 0: { fillPercentage: 0, glassSize: 'small' } });
-    assert.equal(zeroFill[0].fillPercentage, 0);
-    // Surrounding keys are not the contract: the producer keys by section index,
-    // and only the entries we can render survive.
+    const originalSetInterval = global.setInterval;
+    const originalClearInterval = global.clearInterval;
+    const originalHighway = global.highway;
+    const originalFeedBack = global.window.feedBack;
+    global.setInterval = () => 1;
+    global.clearInterval = () => {};
+    global.highway = {
+        getSections: () => [],
+        getSongInfo: () => ({ duration: 0 }),
+        getTime: () => 0,
+    };
+    try {
+        delete global.window.feedBack;
+        mod._smSetPlayerVisible(true);
+        assert.equal(mod._getState().songReadySubscribed, false);
+
+        const bus = fakeEventBus();
+        global.window.feedBack = bus;
+        mod._smSetPlayerVisible(true);
+        assert.equal(bus.count('song:ready'), 1);
+        assert.equal(mod._getState().songReadySubscribed, true);
+    } finally {
+        mod._smSetPlayerVisible(false);
+        global.setInterval = originalSetInterval;
+        global.clearInterval = originalClearInterval;
+        if (typeof originalHighway === 'undefined') delete global.highway;
+        else global.highway = originalHighway;
+        if (typeof originalFeedBack === 'undefined') delete global.window.feedBack;
+        else global.window.feedBack = originalFeedBack;
+    }
+});
+
+test('_smNormalizeSectionTiers separates an unusable payload from an empty one', () => {
+    const mod = freshPlugin();
+    // null: not an object, or no usable sections array -> "ignore the event".
+    assert.equal(mod._smNormalizeSectionTiers(undefined), null);
+    assert.equal(mod._smNormalizeSectionTiers(null), null);
+    assert.equal(mod._smNormalizeSectionTiers(7), null);
+    assert.equal(mod._smNormalizeSectionTiers({ sections: 'nope' }), null);
+    // {}: a well-formed payload with nothing renderable -> "clear the rails".
+    assert.deepEqual(mod._smNormalizeSectionTiers({ sections: [] }), {});
+    assert.deepEqual(mod._smNormalizeSectionTiers(v3Payload([{ index: 0 }])), {});
+    // A null current_tier is real data (unknown, not zero) and survives.
+    const unknown = mod._smNormalizeSectionTiers(v3Payload([v3Section(0, { current_tier: null })]));
+    assert.equal(unknown[0].current_tier, null);
+    // Surrounding keys are not the contract: the producer keys by section index.
     assert.deepEqual(
-        Object.keys(mod._smNormalizeSectionDifficulties({ 0: { fillPercentage: 1 }, schema: 'x' })),
+        Object.keys(mod._smNormalizeSectionTiers(v3Payload([v3Section(0)], { schema: 'x' }))),
         ['0'],
     );
 });
 
+test('_smNormalizeSectionTiersV2 separates an unusable payload from an empty one', () => {
+    const mod = freshPlugin();
+    assert.equal(mod._smNormalizeSectionTiersV2(undefined), null);
+    assert.equal(mod._smNormalizeSectionTiersV2(null), null);
+    assert.equal(mod._smNormalizeSectionTiersV2(7), null);
+    assert.deepEqual(mod._smNormalizeSectionTiersV2({}), {});
+    assert.deepEqual(mod._smNormalizeSectionTiersV2({ 0: 'nope' }), {});
+    // A 0% fill with no ladder and no content is a silent section: no rail.
+    assert.equal(mod._smNormalizeSectionTiersV2({ 0: { fillPercentage: 0, maxDifficulty: 0 } })[0].has_chart_content, false);
+    // A 100% fill with no ladder is the easy-but-playable case: a full rail.
+    const easy = mod._smNormalizeSectionTiersV2({ 0: { fillPercentage: 100, maxDifficulty: 0 } })[0];
+    assert.equal(easy.has_chart_content, true);
+    assert.equal(easy.current_tier, 0);
+});

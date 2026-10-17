@@ -1,12 +1,12 @@
 // Section Map plugin
 // Shows a minimap bar of the full song structure with clickable sections.
-// Includes optional glass-filling difficulty visualization when the
-// Difficulty Ladder plugin (difficulty_ladder) is installed.
+// Includes an optional per-section difficulty tier rail when the Difficulty
+// Ladder plugin (difficulty_ladder) is installed.
 
 let _smBar = null;
 let _smSections = [];
 let _smDuration = 0;
-let _smSectionDifficulty = {}; // Map of section index to difficulty data
+let _smSectionTiers = {}; // Map of section index to a normalized semantic tier entry
 let _smDynamicDifficultyAvailable = false;
 let _smPoller = null;
 let _smPlayerVisible = false;
@@ -24,6 +24,10 @@ let _smBlockEls = [];
 // Index of the block last marked "active" (opacity 1), or -1 when unknown
 // (forces the next tick to (re)apply opacity instead of assuming default).
 let _smActiveIdx = -1;
+// Per-section signature of the last rail paint, so a difficulty refresh only
+// rebuilds the rails whose tier data actually changed. Aligned with
+// _smSections by index; '' means "no tier rail for this section".
+let _smTierSignatures = [];
 
 // Most-specific-first: 'pre' must come before 'chorus'/'verse' so a
 // "pre-chorus"/"pre-verse" section name (which contains both substrings)
@@ -50,6 +54,24 @@ function _smGetColor(name) {
     return SM_COLORS.default;
 }
 
+// The tier-rail tokens, shared by meaning with Difficulty Ladder's standalone
+// guide (#157): gold is a lit tier, faint grey an unlit one, and the lighter
+// gold outline marks `topTier`, the tier from which the entry plays in full.
+// Deliberately the same literals the peer uses rather than Host CSS variables —
+// the meaning is the peer's contract, and the two renderers must move together
+// if either changes.
+const SM_TIER_LIT = '#e8c040';
+const SM_TIER_UNLIT = 'rgba(200,200,200,0.25)';
+const SM_TIER_TOP = '#f4d35e';
+// A segment is a fixed size: difficulty is encoded by how many are lit, never
+// by changing a segment's size (the flaw the glass metaphor had).
+const SM_RAIL_SEGMENT_PX = 5;
+const SM_RAIL_GAP_PX = 1;
+// Space a segment rail needs beyond the segments themselves (rails are inset
+// 2px per side). Below this a block collapses to a single marker instead of a
+// fixed-width ornament crowding out its label.
+const SM_RAIL_PAD_PX = 4;
+
 function _smSubscribeFeedBackEvent(eventName, handler) {
     if (typeof window.feedBack === 'undefined' || typeof window.feedBack.on !== 'function') return null;
     const unsubscribe = window.feedBack.on(eventName, handler);
@@ -59,47 +81,42 @@ function _smSubscribeFeedBackEvent(eventName, handler) {
 }
 
 // The Difficulty Ladder peer contract. Section Map is standalone: everything
-// except the per-section "glass fill" indicator works with no peer plugin at
-// all. Only the glasses depend on `difficulty_ladder` (formerly
-// "dynamic-difficulty"), which owns the difficulty:sections-updated event this
-// plugin renders. The full contract lives in that plugin's INTEGRATION.md; the
-// parts this file depends on are:
+// except the per-section difficulty rail works with no peer plugin at all.
+// Only the rail depends on `difficulty_ladder` (formerly "dynamic-difficulty"),
+// which owns the events this plugin renders. The full contract lives in that
+// plugin's INTEGRATION.md; the parts this file depends on are:
 //
 //   capability  window._ddCapabilities.sectionDifficulty === true, set at that
-//               plugin's top-level script execution. (`_ddCapabilities` predates
-//               its rename from `dynamic_difficulty` to `difficulty_ladder` and
-//               is kept as-is: it is the established marker between the two
-//               plugins.)
-//   event       'difficulty:sections-updated' (schema difficulty_ladder.sections.v2)
-//   payload     event.detail.sectionDifficulties -- an object map keyed by section
-//               index, each entry { fillPercentage, glassSize, avgDifficulty,
-//               maxDifficulty }. A section with no overlapping phrase is simply
-//               absent from the map, which renders as "no glass".
-//   floor       Difficulty Ladder v0.12.0, the release whose CHANGELOG documents
-//               the v2 payload shape above. The event itself shipped in v0.2.0,
-//               but "Difficulty Ladder is installed" is not a compatibility
-//               statement on its own. Note what the floor is and isn't: the
-//               marker below has existed since well before v0.2.0 and carries no
-//               version, so a below-floor peer still passes it and still paints
-//               glasses. What changed below the floor is the arithmetic behind
-//               fillPercentage (v0.9.11 aligned it with the peer's own HUD), so
-//               an old peer renders a glass that can disagree with Difficulty
-//               Ladder's HUD — not one this plugin can detect. Hence a
-//               documented floor rather than an enforced version check.
-//
-// v3 (`difficulty:sections-updated-v3`, a render-neutral payload) is emitted
-// alongside v2 on a separate event name and is deliberately NOT consumed yet:
-// _smRenderGlassFilling/_smUpdateDifficultyFills render glass metaphors, which is
-// exactly what v3 stops prescribing. That is also why the peer's
-// `sectionsSchema` advertisement is not a gate below — it exists for a consumer
-// choosing between v2 and v3, and the peer keeps emitting v2 unchanged
-// alongside v3 either way.
+//               plugin's top-level script execution. A build that also speaks
+//               the render-neutral payload additionally advertises
+//               window._ddCapabilities.sectionsSchema ===
+//               'difficulty_ladder.sections.v3'.
+//   event v3    'difficulty:sections-updated-v3' (schema
+//               difficulty_ladder.sections.v3). Preferred when advertised.
+//   event v2    'difficulty:sections-updated' (schema
+//               difficulty_ladder.sections.v2). Kept only as the bounded-
+//               transition fallback for a peer that does not advertise v3 yet.
+//               It carries the glass presentation fields (fillPercentage,
+//               glassSize); this plugin reads fillPercentage to reconstruct a
+//               coarse rail and ignores glassSize entirely.
+//   payload v3  event.detail = { schema, player_context, mastery, max_tier,
+//               current_phrase_index, sections: [ { id, index, start_time,
+//               end_time, is_current, current_tier, top_tier, max_tier,
+//               avg_top_tier, has_chart_content, phrases } ] }. Sections are
+//               present in `highway.getSections()` order, one entry per section
+//               that has an overlapping phrase; the facts rendered here are
+//               current_tier, top_tier, max_tier and has_chart_content.
+//   floor       v3 is feature-detected via `sectionsSchema`, not version-pinned.
+//               v2's documented floor is Difficulty Ladder v0.12.0, the release
+//               whose CHANGELOG documents that payload shape.
 const _SM_DD_SECTIONS_EVENT = 'difficulty:sections-updated';
+const _SM_DD_SECTIONS_V3_EVENT = 'difficulty:sections-updated-v3';
+const _SM_DD_SECTIONS_SCHEMA_V3 = 'difficulty_ladder.sections.v3';
 
 // Check whether the Difficulty Ladder peer is installed AND speaking the
 // contract above. A bare `_ddCapabilities` global is not enough -- require the
 // named marker, so a foreign plugin that happens to use that global (or a stub
-// left behind by an earlier session) leaves the glasses off rather than
+// left behind by an earlier session) leaves the rail off rather than
 // subscribing to an event whose payload shape we cannot render.
 function _smIsDynamicDifficultyAvailable() {
     if (typeof window.feedBack === 'undefined') return false;
@@ -107,63 +124,139 @@ function _smIsDynamicDifficultyAvailable() {
     return !!caps && typeof caps === 'object' && caps.sectionDifficulty === true;
 }
 
-// Validate one `difficulty_ladder.sections.v2` payload's section map.
+// Whether the peer advertises the render-neutral v3 payload. Read at subscribe
+// time (and re-read on every retry tick until subscribed), never cached
+// forever: the marker appears at the peer's script execution, so a peer that
+// loads after this plugin is picked up on a later tick.
+function _smPeerSpeaksV3() {
+    const caps = window._ddCapabilities;
+    return !!caps && typeof caps === 'object' && caps.sectionsSchema === _SM_DD_SECTIONS_SCHEMA_V3;
+}
+
+// Validate a `difficulty_ladder.sections.v3` payload's section array.
 //
-//   null  the container is not an object -- an unusable payload. Callers must
-//         keep whatever they already have rather than repaint from noise.
-//   {}    a well-formed container with nothing renderable in it, which clears
-//         the glasses (the "no glass, not a stale one" convention).
+//   null  the payload, or its `sections`, is not the shape we can read. The
+//         caller keeps the last good state rather than repainting from noise.
+//   {}    a well-formed payload with no renderable section in it, which clears
+//         the rails (the "no rail, not a stale one" convention).
 //
-// Entries are dropped unless they carry a finite numeric `fillPercentage`. The
-// peer computes it arithmetically, so it is NaN whenever mastery or the phrase
-// difficulty isn't a number — and a NaN sails through the `typeof === 'number'`
-// check the renderer used to do, painting `height:NaN%` and a "Difficulty: NaN%"
-// title. The same check drops anything from a payload that isn't the v2 shape at
-// all, so an entry we can't read renders no glass instead of a misleading
-// near-empty one.
-function _smNormalizeSectionDifficulties(raw) {
+// Entries are dropped unless they carry finite numeric `index`, `max_tier` and
+// `top_tier`. `current_tier` is allowed to be null (the peer emits null when the
+// host reports no usable mastery, or the entry has no ladder) -- that renders an
+// unlit rail with only the full-detail outline, which is honest, not a zero
+// tier. A NaN from the peer's own arithmetic never reaches the markup.
+function _smNormalizeSectionTiers(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    const sections = payload.sections;
+    if (!Array.isArray(sections)) return null;
+    const normalized = {};
+    for (const entry of sections) {
+        if (!entry || typeof entry !== 'object') continue;
+        if (!Number.isFinite(entry.index)) continue;
+        if (!Number.isFinite(entry.max_tier) || entry.max_tier < 0) continue;
+        if (!Number.isFinite(entry.top_tier) || entry.top_tier < 0) continue;
+        normalized[entry.index] = {
+            index: entry.index,
+            max_tier: Math.floor(entry.max_tier),
+            top_tier: Math.floor(entry.top_tier),
+            current_tier: Number.isFinite(entry.current_tier) ? Math.floor(entry.current_tier) : null,
+            has_chart_content: entry.has_chart_content === true,
+        };
+    }
+    return normalized;
+}
+
+// Validate a frozen `difficulty_ladder.sections.v2` section map (the bounded-
+// transition fallback). Same null/{}/entry contract as the v3 normalizer.
+//
+// v2 carries presentation decisions, not tiers: `fillPercentage` is the lit
+// fraction of a glass and `maxDifficulty` is the entry's top-difficulty (the
+// tier it plays in full from). To keep one renderer, reconstruct a coarse rail:
+// `topTier = maxTier = maxDifficulty`, `currentTier = round(fill * topTier)`.
+// That cannot show ladder depth above the full-detail threshold the way v3 can,
+// which is exactly why v3 is preferred; `glassSize` is discarded entirely.
+function _smNormalizeSectionTiersV2(raw) {
     if (!raw || typeof raw !== 'object') return null;
     const normalized = {};
     for (const key of Object.keys(raw)) {
         const entry = raw[key];
         if (!entry || typeof entry !== 'object') continue;
         if (!Number.isFinite(entry.fillPercentage)) continue;
-        normalized[key] = entry;
+        const fill = Math.max(0, Math.min(100, entry.fillPercentage));
+        const topTier = Number.isFinite(entry.maxDifficulty)
+            ? Math.max(0, Math.floor(entry.maxDifficulty))
+            : 0;
+        normalized[key] = {
+            index: Number(key),
+            max_tier: topTier,
+            top_tier: topTier,
+            current_tier: topTier === 0
+                ? (fill >= 100 ? 0 : null)
+                : Math.max(0, Math.min(topTier, Math.round((fill / 100) * topTier))),
+            has_chart_content: topTier > 0 || fill > 0,
+        };
     }
     return normalized;
 }
 
-// Get difficulty data for a section from the Difficulty Ladder peer
-function _smGetSectionDifficulty(sectionIndex) {
+// Get tier data for a section from the Difficulty Ladder peer
+function _smGetSectionTier(sectionIndex) {
     if (!_smDynamicDifficultyAvailable) return null;
-    // Populated by difficulty_ladder's difficulty:sections-updated event.
-    return _smSectionDifficulty[sectionIndex] || null;
+    // Populated by the peer's difficulty:sections-updated[-v3] event.
+    return _smSectionTiers[sectionIndex] || null;
 }
 
-// Initialize difficulty data listener if the Difficulty Ladder peer is available
+// Collapse a normalized entry into the values the rail paints. Returns null
+// when there is nothing to show: no entry at all, or a section whose phrases
+// report no ladder and no chart content (silent, not "easy"). A `top_tier` of 0
+// with content is the easy-but-playable case -- played in full at every slider
+// position -- rendered as a single lit, outlined segment.
+function _smTierModel(entry) {
+    if (!entry) return null;
+    const maxTier = Math.max(0, Math.floor(entry.max_tier) || 0);
+    const topTier = Math.min(Math.max(0, Math.floor(entry.top_tier) || 0), maxTier);
+    if (topTier === 0) {
+        if (!entry.has_chart_content) return null;
+        return { maxTier: 0, topTier: 0, currentTier: 0, full: true };
+    }
+    const currentTier = entry.current_tier == null
+        ? null
+        : Math.max(0, Math.min(topTier, Math.floor(entry.current_tier)));
+    return { maxTier, topTier, currentTier, full: currentTier != null && currentTier >= topTier };
+}
+
+// Initialize the difficulty availability flags if the peer is present.
 function _smInitializeDifficultyListener() {
     _smDynamicDifficultyAvailable = _smIsDynamicDifficultyAvailable();
 }
 
-// difficulty:sections-updated handler.
-function _smOnSectionsUpdated(event) {
-    const normalized = _smNormalizeSectionDifficulties(event && event.detail && event.detail.sectionDifficulties);
-    if (normalized === null) return;
-    _smSectionDifficulty = normalized;
-    // Difficulty refreshes change only the per-section glass fill, not
-    // colors/labels/positions — update those in place rather than paying for a
-    // full _smRender() (which tears down and rebuilds every block's DOM) on
-    // every event, which can fire repeatedly over the course of a song. Falls
-    // back to a full render if the cached blocks don't match the current
-    // section list (bar not built for these sections yet).
+// Shared tail of both event handlers: repaint the rails in place when the bar
+// already matches the current sections, otherwise rebuild the bar.
+function _smApplyTierData() {
     if (_smBar && _smSections.length > 0 && _smBlockEls.length === _smSections.length) {
-        _smUpdateDifficultyFills();
+        _smUpdateTierRails();
     } else {
         _smRender();
     }
 }
 
-// Subscribe to the peer's section-difficulty event if it is available yet.
+// difficulty:sections-updated-v3 handler.
+function _smOnSectionsUpdatedV3(event) {
+    const normalized = _smNormalizeSectionTiers(event && event.detail);
+    if (normalized === null) return;
+    _smSectionTiers = normalized;
+    _smApplyTierData();
+}
+
+// difficulty:sections-updated (v2) handler -- bounded-transition fallback only.
+function _smOnSectionsUpdated(event) {
+    const normalized = _smNormalizeSectionTiersV2(event && event.detail && event.detail.sectionDifficulties);
+    if (normalized === null) return;
+    _smSectionTiers = normalized;
+    _smApplyTierData();
+}
+
+// Subscribe to the peer's section event if it is available yet.
 //
 // This re-runs rather than deciding once per mount on purpose. When both
 // plugins come back 'ready' in one /api/plugins response, core injects screen.js
@@ -183,8 +276,8 @@ function _smOnSectionsUpdated(event) {
 // short-circuiting on a single boolean once registered.
 //
 // One-directional on purpose: a peer that vanishes mid-song leaves its last
-// glasses in place rather than tearing down mid-render, and the contract is
-// that an absent peer means no glasses, never an error.
+// rails in place rather than tearing down mid-render, and the contract is that
+// an absent peer means no rails, never an error.
 function _smEnsureDifficultySubscription() {
     if (_smDifficultySubscribed) return;
     _smInitializeDifficultyListener();
@@ -196,7 +289,11 @@ function _smEnsureDifficultySubscription() {
     // unsubscribe handle, and re-registering every 200ms because it didn't
     // would leak a handler per tick.
     _smDifficultySubscribed = true;
-    _smDifficultyUnsubscribe = _smSubscribeFeedBackEvent(_SM_DD_SECTIONS_EVENT, _smOnSectionsUpdated);
+    if (_smPeerSpeaksV3()) {
+        _smDifficultyUnsubscribe = _smSubscribeFeedBackEvent(_SM_DD_SECTIONS_V3_EVENT, _smOnSectionsUpdatedV3);
+    } else {
+        _smDifficultyUnsubscribe = _smSubscribeFeedBackEvent(_SM_DD_SECTIONS_EVENT, _smOnSectionsUpdated);
+    }
 }
 
 function _smStartRealtimeHooks() {
@@ -206,7 +303,7 @@ function _smStartRealtimeHooks() {
         _smSongReadyUnsubscribe = _smSubscribeFeedBackEvent('song:ready', () => {
             _smSections = [];
             _smDuration = 0;
-            _smSectionDifficulty = {};
+            _smSectionTiers = {};
             _smUpdate();
         });
         _smSongReadySubscribed = typeof _smSongReadyUnsubscribe === 'function';
@@ -272,6 +369,7 @@ function _smRemove() {
     _smMarkerEl = null;
     _smBlockEls = [];
     _smActiveIdx = -1;
+    _smTierSignatures = [];
 }
 
 // The playback clock, across whichever backend is driving audio. getTime() is
@@ -340,7 +438,7 @@ function _smOnWheel(e) {
 
 function _smUpdate() {
     // Retry the Difficulty Ladder handshake before anything else: the peer may
-    // have loaded (or reloaded) after this plugin did, and glasses are the one
+    // have loaded (or reloaded) after this plugin did, and the rail is the one
     // thing that can't wait for the next song. No-op once subscribed.
     _smEnsureDifficultySubscription();
 
@@ -374,11 +472,12 @@ function _smUpdate() {
         if (_smBar.innerHTML !== '') {
             _smSections = [];
             _smDuration = 0;
-            _smSectionDifficulty = {};
+            _smSectionTiers = {};
             _smBar.innerHTML = '';
             _smMarkerEl = null;
             _smBlockEls = [];
             _smActiveIdx = -1;
+            _smTierSignatures = [];
         }
         return;
     }
@@ -420,10 +519,83 @@ function _smUpdate() {
     }
 }
 
+// The on-bar label drops a trailing digit (no room for "Verse 2" in a
+// ~9px-tall strip), but the hover title keeps it — otherwise two "Verse"
+// blocks are indistinguishable on mouseover.
+function _smSectionLabel(sec) {
+    const ordinalMatch = sec.name.match(/(\d+)$/);
+    let label = sec.name.replace(/\d+$/, '').trim();
+    label = label.charAt(0).toUpperCase() + label.slice(1);
+    return { label, titleLabel: ordinalMatch ? `${label} ${ordinalMatch[1]}` : label };
+}
+
+// The readable tier detail shared by the hover title and the accessible name:
+// `tier X of Y · full detail at Z`. `Y` is maxTier, `Z` is topTier; the
+// full-detail clause is omitted when there is no ladder to climb (maxTier 0).
+// currentTier null is "tier unknown", not a zero tier.
+function _smTierSuffix(model) {
+    if (!model) return '';
+    if (model.currentTier == null) {
+        return model.maxTier > 0 ? `tier unknown · full detail at ${model.topTier}` : 'tier unknown';
+    }
+    const tierText = `tier ${model.currentTier} of ${model.maxTier}`;
+    return model.maxTier > 0 ? `${tierText} · full detail at ${model.topTier}` : tierText;
+}
+
+// A rail cell that fits: one fixed-size segment per tier (maxTier + 1), the
+// first currentTier + 1 lit, and the segment at topTier outlined.
+function _smRailSegmentsMarkup(model) {
+    let html = '';
+    for (let tier = 0; tier <= model.maxTier; tier++) {
+        const lit = model.currentTier != null && tier <= model.currentTier;
+        const top = tier === model.topTier;
+        html += `<span class="sm-rail-seg" style="width:${SM_RAIL_SEGMENT_PX}px;height:5px;border-radius:1px;background:${lit ? SM_TIER_LIT : SM_TIER_UNLIT};${top ? `outline:1px solid ${SM_TIER_TOP};outline-offset:1px;` : ''}"></span>`;
+    }
+    return html;
+}
+
+// Degraded form for a block too narrow for segments: a single marker that is
+// lit once a tier is known and outlined when the entry is already played in
+// full. The readable detail still travels on the block's label.
+function _smRailCollapsedMarkup(model) {
+    const lit = model.currentTier != null;
+    return `<span class="sm-rail-seg sm-rail-marker" style="width:${SM_RAIL_SEGMENT_PX}px;height:5px;border-radius:1px;background:${lit ? SM_TIER_LIT : SM_TIER_UNLIT};${model.full ? `outline:1px solid ${SM_TIER_TOP};outline-offset:1px;` : ''}"></span>`;
+}
+
+// Whether the segment rail would not fit in `blockPx`. A non-positive width
+// means "could not measure" (the bar isn't laid out yet), where the segments are
+// kept: the rail is overflow-hidden, so it degrades gracefully instead of us
+// guessing wrong.
+function _smShouldCollapse(blockPx, model) {
+    if (!(blockPx > 0)) return false;
+    const segCount = model.maxTier + 1;
+    const needed = segCount * SM_RAIL_SEGMENT_PX + (segCount - 1) * SM_RAIL_GAP_PX;
+    return blockPx < needed + SM_RAIL_PAD_PX;
+}
+
+function _smRailInner(model, blockPx) {
+    return _smShouldCollapse(blockPx, model)
+        ? _smRailCollapsedMarkup(model)
+        : _smRailSegmentsMarkup(model);
+}
+
+// The rail container: anchored to the bottom edge of the section block so it
+// never competes with the centered label. aria-hidden because the block's own
+// aria-label carries the readable detail; the segments are its visual encoding.
+function _smRenderTierRail(model, blockPx) {
+    const style = `position:absolute;left:2px;right:2px;bottom:1px;display:flex;gap:${SM_RAIL_GAP_PX}px;justify-content:center;align-items:flex-end;pointer-events:none;overflow:hidden;`;
+    return `<div class="sm-rail" aria-hidden="true" style="${style}">${_smRailInner(model, blockPx)}</div>`;
+}
+
+function _smTierSignature(model) {
+    return model ? `${model.maxTier}|${model.topTier}|${model.currentTier}|${model.full ? 1 : 0}` : '';
+}
+
 function _smRender() {
     if (!_smBar || !_smSections.length || !_smDuration) return;
 
     let html = '';
+    const barWidth = _smBar.getBoundingClientRect ? _smBar.getBoundingClientRect().width : 0;
 
     for (let i = 0; i < _smSections.length; i++) {
         const sec = _smSections[i];
@@ -432,30 +604,33 @@ function _smRender() {
         const widthPct = ((nextTime - sec.time) / _smDuration) * 100;
         const color = _smGetColor(sec.name);
 
-        // Clean up section name for display
-        const ordinalMatch = sec.name.match(/(\d+)$/);
-        let label = sec.name.replace(/\d+$/, '').trim();
-        label = label.charAt(0).toUpperCase() + label.slice(1);
-        // The on-bar label drops the trailing digit (no room for "Verse 2" in
-        // a ~9px-tall strip), but the hover title keeps it — otherwise two
-        // "Verse" blocks are indistinguishable on mouseover.
-        const titleLabel = ordinalMatch ? `${label} ${ordinalMatch[1]}` : label;
-
-        // Get difficulty data if available
-        const difficulty = _smGetSectionDifficulty(i);
-        const difficultyContent = _smDynamicDifficultyAvailable && difficulty
-            ? _smRenderGlassFilling(difficulty)
-            : '';
-
+        const { label, titleLabel } = _smSectionLabel(sec);
         const safeLabel = _smEscapeHtml(label);
         const safeTitle = _smEscapeHtml(`${titleLabel} (${_smFmt(sec.time)})`);
+
+        // Semantic tier data, when the peer is present. blockPx is an estimate
+        // from the bar's laid-out width; it only decides whether the rail draws
+        // segments or collapses to a marker.
+        const model = _smTierModel(_smGetSectionTier(i));
+        const blockPx = barWidth > 0 ? (widthPct / 100) * barWidth : 0;
+        const railContent = model ? _smRenderTierRail(model, blockPx) : '';
+        const tierSuffix = _smTierSuffix(model);
+        const fullTitle = tierSuffix
+            ? `${safeTitle} · ${_smEscapeHtml(tierSuffix)}`
+            : safeTitle;
+        // One focus stop per section with tier data, carrying the readable
+        // detail so keyboard/AT users are not limited to the hover title.
+        const ariaAttr = model
+            ? ` tabindex="0" aria-label="${_smEscapeHtml(`${titleLabel} · ${tierSuffix}`)}"`
+            : '';
+
         // opacity starts at 0.5 (the "inactive" state) so _smUpdate's per-tick
         // highlight pass only ever needs to touch the blocks whose active
         // state actually changed, instead of rewriting every block's opacity
         // on every poll.
         html += `<div class="sm-block" style="position:absolute;left:${startPct}%;width:${widthPct}%;top:0;bottom:0;background:${color};border-right:1px solid rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;overflow:hidden;transition:opacity 0.15s;opacity:0.5;"
-            title="${safeTitle}">
-            ${difficultyContent}
+            title="${fullTitle}"${ariaAttr}>
+            ${railContent}
             <span style="font-size:9px;color:rgba(255,255,255,0.8);white-space:nowrap;text-overflow:ellipsis;overflow:hidden;padding:0 3px;">${safeLabel}</span>
         </div>`;
     }
@@ -471,87 +646,85 @@ function _smRender() {
     _smMarkerEl = _smBar.querySelector ? _smBar.querySelector('#sm-marker') : null;
     _smBlockEls = _smBar.querySelectorAll ? Array.from(_smBar.querySelectorAll('.sm-block')) : [];
     _smActiveIdx = -1;
+    _smTierSignatures = _smSections.map((_, i) => _smTierSignature(_smTierModel(_smGetSectionTier(i))));
 }
 
-// Size buckets for the glass, keyed by the difficulty_ladder.sections.v2
-// `glassSize` value. Module-level because two call sites need it: the renderer
-// below and _smUpdateDifficultyFills()'s size-change comparison.
-const SM_GLASS_SIZES = {
-    small: 'width:12px;height:12px;',
-    medium: 'width:16px;height:16px;',
-    large: 'width:20px;height:20px;',
-};
-
-// The one place a peer's `glassSize` enters our markup: it lands unescaped in
-// the `data-size` attribute, so resolve it against the allowlist first rather
-// than trusting the string. Anything unrecognized (including markup) becomes
-// `medium`, matching the style fallback.
-function _smGlassSize(difficulty) {
-    const size = difficulty && difficulty.glassSize;
-    return Object.prototype.hasOwnProperty.call(SM_GLASS_SIZES, size) ? size : 'medium';
+// Refresh only the per-section tier rails in place (segments + readable label)
+// instead of rebuilding the whole section-map bar. Called from the peer's
+// section-difficulty events, which can fire repeatedly while a song plays as
+// difficulty_ladder re-derives each section's tiers — none of that data changes
+// section colors/labels/positions, so a full _smRender() on every event would
+// tear down and rebuild every block's DOM just to repaint a few small rails.
+// A per-section signature skips the rails whose tier data did not change.
+function _smUpdateBlockRail(block, model, blockPx) {
+    if (!block || typeof block.querySelector !== 'function') return;
+    const rail = block.querySelector('.sm-rail');
+    if (model) {
+        if (rail) rail.innerHTML = _smRailInner(model, blockPx);
+        else block.insertAdjacentHTML('afterbegin', _smRenderTierRail(model, blockPx));
+    } else if (rail) {
+        rail.remove();
+    }
 }
 
-// Render glass-filling visualization for section difficulty
-function _smRenderGlassFilling(difficulty) {
-    // isFinite, not typeof: the peer derives this arithmetically and a NaN
-    // mastery or phrase difficulty yields NaN, which is typeof 'number' and
-    // would otherwise reach the style attribute as `height:NaN%`.
-    if (!difficulty || !Number.isFinite(difficulty.fillPercentage)) return '';
-
-    const fillPct = Math.max(0, Math.min(100, difficulty.fillPercentage));
-    const glassSize = _smGlassSize(difficulty);
-    const glassStyle = SM_GLASS_SIZES[glassSize];
-
-    // Classed (and size-tagged) so _smUpdateDifficultyFills() can update an
-    // existing glass's fill height/title in place on a difficulty refresh,
-    // instead of the caller having to rebuild the whole section-map bar just
-    // to redraw it.
-    return `<div class="sm-glass" data-size="${glassSize}" style="position:relative;${glassStyle}margin-right:4px;background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.4);border-radius:2px;display:flex;align-items:flex-end;overflow:hidden;"
-        title="Difficulty: ${fillPct.toFixed(0)}%">
-        <div class="sm-glass-fill" style="width:100%;height:${fillPct}%;background:rgba(255,200,100,0.7);transition:height 0.3s ease;"></div>
-    </div>`;
-}
-
-// Refresh only the per-section difficulty "glass fill" indicators in place
-// (fill height + title) instead of rebuilding the whole section-map bar.
-// Called from the 'difficulty:sections-updated' event, which can fire
-// repeatedly while a song plays as difficulty_ladder re-derives each section's
-// difficulty — none of that data changes section colors/labels/positions, so a
-// full _smRender() on every event would tear down and rebuild every block's DOM
-// just to repaint a handful of small fill bars.
-function _smUpdateDifficultyFills() {
-    if (!_smBar || !_smBlockEls.length) return;
-    for (let i = 0; i < _smBlockEls.length; i++) {
-        const block = _smBlockEls[i];
-        if (!block || typeof block.querySelector !== 'function') continue;
-        const difficulty = _smGetSectionDifficulty(i);
-        const glass = block.querySelector('.sm-glass');
-        if (_smDynamicDifficultyAvailable && difficulty && Number.isFinite(difficulty.fillPercentage)) {
-            const fillPct = Math.max(0, Math.min(100, difficulty.fillPercentage));
-            const glassSize = _smGlassSize(difficulty);
-            const sizeChanged = glass && glass.getAttribute && glass.getAttribute('data-size') !== glassSize;
-            if (glass && !sizeChanged) {
-                // Same glass already present (the common case while a song
-                // plays) — just update its fill height and title.
-                glass.title = `Difficulty: ${fillPct.toFixed(0)}%`;
-                const fillEl = glass.querySelector('.sm-glass-fill');
-                if (fillEl) fillEl.style.height = fillPct + '%';
-            } else {
-                // No glass yet, or its size bucket changed — (re)build just
-                // this one glass element rather than the whole bar.
-                if (glass) glass.remove();
-                block.insertAdjacentHTML('afterbegin', _smRenderGlassFilling(difficulty));
-            }
-        } else if (glass) {
-            glass.remove();
+function _smUpdateBlockAttributes(block, sec, model) {
+    if (!block || typeof block.querySelector !== 'function') return;
+    const { titleLabel } = _smSectionLabel(sec);
+    const tierSuffix = _smTierSuffix(model);
+    const baseTitle = `${titleLabel} (${_smFmt(sec.time)})`;
+    block.title = tierSuffix ? `${baseTitle} · ${tierSuffix}` : baseTitle;
+    // Mirror _smRender's attributes exactly, in both directions: a block
+    // that gains tier data becomes a focus stop, and one that loses it
+    // stops being one (otherwise tabindex lingers on a bare, unnamed div).
+    if (typeof block.setAttribute === 'function' && typeof block.removeAttribute === 'function') {
+        if (model) {
+            block.setAttribute('aria-label', `${titleLabel} · ${tierSuffix}`);
+            block.setAttribute('tabindex', '0');
+        } else {
+            block.removeAttribute('aria-label');
+            block.removeAttribute('tabindex');
         }
     }
+}
+
+function _smUpdateTierRails() {
+    if (!_smBar || !_smBlockEls.length) return;
+    const barWidth = _smBar.getBoundingClientRect ? _smBar.getBoundingClientRect().width : 0;
+    for (let i = 0; i < _smSections.length; i++) {
+        const model = _smTierModel(_smGetSectionTier(i));
+        const signature = _smTierSignature(model);
+        if (_smTierSignatures[i] === signature) continue;
+        _smTierSignatures[i] = signature;
+
+        const block = _smBlockEls[i];
+        if (!block) continue;
+
+        const sec = _smSections[i];
+        const nextTime = i < _smSections.length - 1 ? _smSections[i + 1].time : _smDuration;
+        const widthPct = _smDuration > 0 ? ((nextTime - sec.time) / _smDuration) * 100 : 0;
+        const blockPx = barWidth > 0 ? (widthPct / 100) * barWidth : 0;
+
+        _smUpdateBlockRail(block, model, blockPx);
+        _smUpdateBlockAttributes(block, sec, model);
+    }
+}
+
+// A window/bar resize changes how many pixels each block has, which is what
+// decides between the segment rail and the collapsed marker. The signature
+// deliberately excludes width (tier data is what it tracks), so a resize has to
+// invalidate the signatures and repaint for that width-dependent form to be
+// re-decided. Without this, a block that crossed the collapse threshold on
+// resize would keep the other form until its tier data or the section list next
+// changed. Cheap: one repaint per resize, none per _smUpdate tick.
+function _smHandleResize() {
+    if (!_smBar) return;
+    _smTierSignatures = [];
+    _smUpdateTierRails();
 }
 
 function _smFmt(s) {
     return Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
 }
-
 function _smEscapeHtml(value) {
     return String(value)
         .replace(/&/g, '&amp;')
@@ -567,20 +740,22 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         _smGetColor, _smFmt, _smCreate, _smRemove, _smUpdate, _smRender,
         _smOnClick, _smOnWheel, _smEscapeHtml,
-        _smIsDynamicDifficultyAvailable, _smGetSectionDifficulty, _smRenderGlassFilling,
-        _smUpdateDifficultyFills,
-        _smNormalizeSectionDifficulties, _smOnSectionsUpdated, _smEnsureDifficultySubscription,
+        _smIsDynamicDifficultyAvailable, _smPeerSpeaksV3, _smGetSectionTier,
+        _smTierModel, _smTierSuffix, _smRenderTierRail, _smUpdateTierRails, _smHandleResize,
+        _smNormalizeSectionTiers, _smNormalizeSectionTiersV2,
+        _smOnSectionsUpdated, _smOnSectionsUpdatedV3, _smEnsureDifficultySubscription,
         _smInitializeDifficultyListener, _smStartRealtimeHooks, _smStopRealtimeHooks, _smSetPlayerVisible,
         _getState: () => ({
-            bar: _smBar, sections: _smSections, duration: _smDuration, sectionDifficulty: _smSectionDifficulty,
+            bar: _smBar, sections: _smSections, duration: _smDuration, sectionTiers: _smSectionTiers,
             ddAvailable: _smDynamicDifficultyAvailable, markerEl: _smMarkerEl, blockEls: _smBlockEls, activeIdx: _smActiveIdx,
+            tierSignatures: _smTierSignatures,
             songReadySubscribed: _smSongReadySubscribed, difficultySubscribed: _smDifficultySubscribed,
         }),
         _setState(next) {
             if ('sections' in next) _smSections = next.sections;
             if ('duration' in next) _smDuration = next.duration;
             if ('bar' in next) _smBar = next.bar;
-            if ('sectionDifficulty' in next) _smSectionDifficulty = next.sectionDifficulty;
+            if ('sectionTiers' in next) _smSectionTiers = next.sectionTiers;
             if ('ddAvailable' in next) _smDynamicDifficultyAvailable = next.ddAvailable;
             if ('poller' in next) _smPoller = next.poller;
             if ('playerVisible' in next) _smPlayerVisible = next.playerVisible;
@@ -591,6 +766,7 @@ if (typeof module !== 'undefined' && module.exports) {
             if ('markerEl' in next) _smMarkerEl = next.markerEl;
             if ('blockEls' in next) _smBlockEls = next.blockEls;
             if ('activeIdx' in next) _smActiveIdx = next.activeIdx;
+            if ('tierSignatures' in next) _smTierSignatures = next.tierSignatures;
         },
     };
 } else {
@@ -611,7 +787,7 @@ if (typeof module !== 'undefined' && module.exports) {
         _smRemove();
         _smSections = [];
         _smDuration = 0;
-        _smSectionDifficulty = {};
+        _smSectionTiers = {};
         await origPlaySong(filename, arrangement);
         if (_smPlayerVisible) _smCreate();
     };
@@ -626,6 +802,12 @@ if (typeof module !== 'undefined' && module.exports) {
     // emits rather than a global it no longer calls through.
     _smSubscribeFeedBackEvent('screen:changed', (event) => {
         _smSetPlayerVisible((event.detail && event.detail.id) === 'player');
+    });
+
+    // Re-decide the width-dependent rail form on resize. Installed inside the
+    // same idempotency guard as every other top-level listener/timer.
+    window.addEventListener('resize', () => {
+        if (_smPlayerVisible) _smHandleResize();
     });
 })();
 
